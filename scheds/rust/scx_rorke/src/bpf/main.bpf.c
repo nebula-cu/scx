@@ -24,7 +24,7 @@ char _license[] SEC("license") = "GPL";
 UEI_DEFINE(uei);
 
 /*
- * Following are parameters to scheduler and  set again during initialization.
+ * Followings are parameters to scheduler and set again during initialization.
  * Here we assign values just to pass the verifier.
  */
 const volatile u32 central_cpu = 0;
@@ -231,7 +231,7 @@ static int global_timer_fn(void* map, int* key, struct bpf_timer* timer) {
     }
 
     now = bpf_ktime_get_ns();
-    delta = now - cctx->last_running + 5000;
+    delta = now - cctx->last_running + 5000; // Why 5000?
     // if (delta < timer_interval_ns - 5000) {
     if (delta < timer_interval_ns) {
       trace("global_timer_fn: CPU %d ran %d (< interval - %d) ago, skipping",
@@ -240,7 +240,7 @@ static int global_timer_fn(void* map, int* key, struct bpf_timer* timer) {
     }
 //
     if (scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | current_cpu))
-      trace("global_timer_fn: local non-empty, will kick CPU %d", current_cpu);
+      trace("global_timer_fn: local non-empty, will kick CPU %d", current_cpu); // Most probably for the some locally pinned tasks, e.x. some kthreads
     else if (scx_bpf_dsq_nr_queued(cctx->vm_id))
       trace("global_timer_fn: VM %d queue non-empty, will kick CPU %d",
             cctx->vm_id, current_cpu);

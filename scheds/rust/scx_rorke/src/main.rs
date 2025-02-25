@@ -67,6 +67,10 @@ struct Opts {
     #[clap(short = 't', long, default_value = "100")]
     timer_interval: u64,
 
+    /// CPU reallocation freqency ([realloc per <realloc_cycles> timer intervals, do not realloc if 0])
+    #[clap(short ='r', long, default_value = "1000")]
+    realloc_cycles: u64,
+
     /// Config file
     #[clap(short = 'f', long)]
     config_file: Option<String>,
@@ -99,6 +103,7 @@ struct Opts {
     #[clap(long)]
     help_stats: bool,
 }
+
 fn convert_cpu_ctxs(cpu_ctxs: Vec<bpf_intf::cpu_ctx>) -> Vec<Vec<u8>> {
     cpu_ctxs
         .into_iter()
@@ -113,6 +118,32 @@ fn convert_cpu_ctxs(cpu_ctxs: Vec<bpf_intf::cpu_ctx>) -> Vec<Vec<u8>> {
         })
         .collect()
 }
+
+fn get_cpu_allocation(skel: &BpfSkel) -> Result<Vec<u64>> {
+    let key = (0_u32).to_ne_bytes();
+    let mut cpu_ctxs: Vec<bpf_intf::cpu_ctx> = vec![];
+    
+    let cpu_ctxs_vec = skel
+        .maps
+        .cpu_ctx_stor
+        .lookup_percpu(&key, libbpf_rs::MapFlags::ANY)
+        .context("Failed to lookup cpu_ctx")?
+        .unwrap();
+
+    for cpu in 0..*NR_POSSIBLE_CPUS {
+        cpu_ctxs.push(*unsafe {
+            &*(cpu_ctxs_vec[cpu].as_slice().as_ptr() as *const bpf_intf::cpu_ctx)
+        });
+    }
+
+    let mut cpu_allocation = vec![];
+    for cpu_ctx in cpu_ctxs.iter() {
+        cpu_allocation.push(cpu_ctx.vm_id);
+    }
+
+    Ok(cpu_allocation)
+}
+
 
 fn get_per_cpu_preempted(skel: &BpfSkel) -> Result<Vec<u64>> {
     let key = (0_u32).to_ne_bytes();
@@ -198,6 +229,8 @@ impl<'a> Scheduler<'a> {
         let vm_config =
             parse_vm_config(&fs::read_to_string(config_path).context("Failed to find file")?)
                 .context("Failed to parse config file")?;
+        
+        info!("VM config: {:?}", vm_config);
         let cpu_allocation = allocate_cpus_to_vms(&vm_config, opts.num_cpus);
         info!("CPU allocation: {:?}", cpu_allocation);
 
@@ -206,6 +239,7 @@ impl<'a> Scheduler<'a> {
         skel.maps.rodata_data.nr_cpus = opts.num_cpus;
         skel.maps.rodata_data.nr_vms = vm_config.len() as u32;
         skel.maps.rodata_data.timer_interval_ns = opts.timer_interval * 1000;
+        skel.maps.rodata_data.realloc_cycles = opts.realloc_cycles;
 
         for (i, vm) in vm_config.iter().enumerate() {
             skel.maps.rodata_data.vms[i] = vm.vm_id;
@@ -274,6 +308,7 @@ impl<'a> Scheduler<'a> {
             nr_direct_to_idle_dispatches: self.skel.maps.bss_data.nr_direct_to_idle_dispatches,
             nr_vm_dispatches: self.skel.maps.bss_data.nr_vm_dispatches,
             per_cpu_preempted: get_per_cpu_preempted(&self.skel).expect("Failed to get per_cpu_preempted"),
+            cpu_allocation: get_cpu_allocation(&self.skel).expect("Failed to get cpu_allocation"),
         }
     }
 

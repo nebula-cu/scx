@@ -28,6 +28,8 @@ pub struct Metrics {
     pub nr_vm_dispatches: u64,
     #[stat(desc = "Number of preemptions per CPU")]
     pub per_cpu_preempted: Vec<u64>,
+    #[stat(desc = "pCPU to VM allocation")]
+    pub cpu_allocation: Vec<u64>, // Or maybe a HashMap<u64, u64>?, a mapping of pCPU to VM id
 }
 
 impl Metrics {
@@ -48,7 +50,7 @@ impl Metrics {
         )?;
 
         // Limit preemption output to nr_cpus and align it in columns, with consistent padding
-        writeln!(w, "     Preemptions:")?;
+        writeln!(w, "     Core preemptions:")?;
         for (cpu_id, preemptions) in self
             .per_cpu_preempted
             .iter()
@@ -56,6 +58,16 @@ impl Metrics {
             .take(self.nr_cpus as usize)
         {
             writeln!(w, "     CPU #{}: {:<5?}", cpu_id, preemptions)?; // Align CPU# output with padding
+        }
+        // Also print out core allocations
+        writeln!(w, "     Core allocations:")?;
+        for (cpu_id, vm_id) in self
+            .cpu_allocation
+            .iter()
+            .enumerate()
+            .take(self.nr_cpus as usize)
+        {
+            writeln!(w, "     CPU #{}: {:<5?}", cpu_id, vm_id)?; // Align CPU# output with padding
         }
 
         Ok(())
