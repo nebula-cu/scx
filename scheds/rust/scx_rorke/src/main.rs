@@ -67,8 +67,8 @@ struct Opts {
     #[clap(short = 't', long, default_value = "100")]
     timer_interval: u64,
 
-    /// CPU reallocation freqency ([realloc per <realloc_cycles> timer intervals, do not realloc if 0])
-    #[clap(short ='r', long, default_value = "1000")]
+    /// CPU reallocation freqency ([realloc per <realloc_cycles> timer intervals, do not realloc if 0 (default)])
+    #[clap(short ='r', long, default_value = "0")]
     realloc_cycles: u64,
 
     /// Config file

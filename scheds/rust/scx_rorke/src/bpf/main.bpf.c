@@ -31,12 +31,15 @@ const volatile u32 central_cpu = 0;
 const volatile u32 nr_cpus = 1;
 const volatile u32 nr_vms = 1;
 const volatile u64 timer_interval_ns = 100000;
+const volatile u64 realloc_cycles = 0; // do not realloc by default
 const volatile u64 vms[MAX_VMS];
 const volatile u32 debug = 0;
 
 /* Scheduling statistics */
 volatile u64 nr_direct_to_idle_dispatches, nr_kthread_dispatches,
     nr_vm_dispatches, nr_running;
+
+volatile u64 realloc_cnt = 0;
 
 /*
  * Timer for preempting CPUs.
@@ -204,6 +207,61 @@ void BPF_STRUCT_OPS(rorke_stopping, struct task_struct* p, bool runnable) {
   __sync_fetch_and_sub(&nr_running, 1);
 }
 
+static void realloc_cpu_to_vm() {
+  u32 cpu, vm, total_tasks = 0;
+  u64 vm_task_counts[MAX_VMS] = {0};
+  u32 vm_cpu_allocs[MAX_VMS] = {0};
+
+  /* Count tasks in each VM queue */
+  bpf_for(vm, 0, nr_vms) {
+    vm_task_counts[vm] = scx_bpf_dsq_nr_queued(vms[vm]);
+    total_tasks += vm_task_counts[vm];
+  }
+
+  /* If no tasks, reset CPU allocations */
+  if (total_tasks == 0) {
+    bpf_for(cpu, 0, nr_cpus) {
+      // Skip central CPU
+      if (cpu == central_cpu)
+        continue;
+      struct cpu_ctx* cctx = try_lookup_cpu_ctx(cpu);
+      if (cctx)
+        cctx->vm_id = 0;  // No VM assigned
+    }
+    return;
+  }
+
+  /* Compute proportional CPU allocations */
+  bpf_for(vm, 0, nr_vms) {
+    if (vm_task_counts[vm] > 0) {
+      vm_cpu_allocs[vm] = (vm_task_counts[vm] * nr_cpus) / total_tasks;
+    }
+  }
+
+  /* Assign CPUs to VMs */
+  u32 assigned_cpus = 0;
+  bpf_for(cpu, 0, nr_cpus) {
+    if (cpu == central_cpu)
+      continue;
+    struct cpu_ctx* cctx = try_lookup_cpu_ctx(cpu);
+    if (!cctx)
+      continue;
+
+    /* Find a VM with remaining CPU allocations */
+    for (vm = 0; vm < nr_vms; vm++) {
+      if (vm_cpu_allocs[vm] > 0) {
+        cctx->vm_id = vms[vm];
+        vm_cpu_allocs[vm]--;
+        assigned_cpus++;
+        break;
+      }
+    }
+  }
+
+  trace("realloc_cpu_to_vm: Distributed %d CPUs across %d VMs", assigned_cpus, nr_vms);
+}
+
+
 /*
  * TODO: Add description for timer functionality
  */
@@ -252,6 +310,15 @@ static int global_timer_fn(void* map, int* key, struct bpf_timer* timer) {
     scx_bpf_kick_cpu(current_cpu, SCX_KICK_PREEMPT);
     cctx->preempted++;
     trace("global_timer_fn: preempted CPU %d", current_cpu);
+  }
+
+  if (realloc_cycles > 0) {
+    if (realloc_cnt >= realloc_cycles) {
+      realloc_cnt = 0;
+      realloc_cpu_to_vm();  // Trigger CPU reallocation
+    } else {
+      realloc_cnt++;  // Increment counter if threshold not reached
+    }
   }
 
   bpf_timer_start(timer, timer_interval_ns, BPF_F_TIMER_CPU_PIN);
