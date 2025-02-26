@@ -61,13 +61,12 @@ pub use libbpf_logger::init_libbpf_logging;
 pub mod ravg;
 
 mod topology;
-pub use topology::Cache;
 pub use topology::Core;
 pub use topology::CoreType;
 pub use topology::Cpu;
+pub use topology::Llc;
 pub use topology::Node;
 pub use topology::Topology;
-pub use topology::TopologyMap;
 pub use topology::NR_CPUS_POSSIBLE;
 pub use topology::NR_CPU_IDS;
 
@@ -80,10 +79,17 @@ mod infeasible;
 pub use infeasible::LoadAggregator;
 pub use infeasible::LoadLedger;
 
-mod log_recorder;
-pub use log_recorder::LogRecorderBuilder;
-
-mod misc;
+pub mod misc;
 pub use misc::monitor_stats;
 pub use misc::normalize_load_metric;
 pub use misc::set_rlimit_infinity;
+
+mod netdev;
+pub use netdev::read_netdevs;
+pub use netdev::NetDev;
+
+pub mod enums;
+pub use enums::scx_enums;
+
+#[cfg(feature = "autopower")]
+pub mod autopower;

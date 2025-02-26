@@ -4,3 +4,5 @@ PKGBUILD
 target
 *.swp
 .cache/
+.vscode/
+tags

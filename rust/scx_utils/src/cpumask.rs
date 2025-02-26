@@ -46,11 +46,11 @@
 //!     mask.set_cpu(0);
 //!     assert!(mask.test_cpu(0));
 //!
-//!     mask.clear();
+//!     mask.clear_all();
 //!     info!("{:#?}", mask); // 32:<00000000000000000000000000000000>
 //!     assert!(!mask.test_cpu(0));
 //!
-//!     mask.setall();
+//!     mask.set_all();
 //!     info!("{:#?}", mask); // 32:<11111111111111111111111111111111>
 //!     assert!(mask.test_cpu(0));
 //!```
@@ -61,14 +61,11 @@ use anyhow::Context;
 use anyhow::Result;
 use bitvec::prelude::*;
 use std::fmt;
-use std::ops::BitAnd;
 use std::ops::BitAndAssign;
-use std::ops::BitOr;
 use std::ops::BitOrAssign;
-use std::ops::BitXor;
 use std::ops::BitXorAssign;
 
-#[derive(Debug, Eq, Clone, Ord, PartialEq, PartialOrd)]
+#[derive(Debug, Eq, Clone, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Cpumask {
     mask: BitVec<u64, Lsb0>,
 }
@@ -83,15 +80,15 @@ impl Cpumask {
     }
 
     /// Build a new empty Cpumask object.
-    pub fn new() -> Result<Cpumask> {
-        Ok(Cpumask {
+    pub fn new() -> Cpumask {
+        Cpumask {
             mask: bitvec![u64, Lsb0; 0; *NR_CPU_IDS],
-        })
+        }
     }
 
     /// Build a Cpumask object from a hexadecimal string.
-    pub fn from_str(cpumask: &String) -> Result<Cpumask> {
-        match cpumask.as_str() {
+    pub fn from_str(cpumask: &str) -> Result<Cpumask> {
+        match cpumask {
             "none" => {
                 let mask = bitvec![u64, Lsb0; 0; *NR_CPU_IDS];
                 return Ok(Self { mask });
@@ -146,6 +143,10 @@ impl Cpumask {
         }
     }
 
+    pub fn from_bitvec(bitvec: BitVec<u64, Lsb0>) -> Self {
+        Self { mask: bitvec }
+    }
+
     /// Return a slice of u64's whose bits reflect the Cpumask.
     pub fn as_raw_slice(&self) -> &[u64] {
         self.mask.as_raw_slice()
@@ -162,12 +163,12 @@ impl Cpumask {
     }
 
     /// Set all bits in the Cpumask to 1
-    pub fn setall(&mut self) {
+    pub fn set_all(&mut self) {
         self.mask.fill(true);
     }
 
     /// Set all bits in the Cpumask to 0
-    pub fn clear(&mut self) {
+    pub fn clear_all(&mut self) {
         self.mask.fill(false);
     }
 
@@ -216,6 +217,13 @@ impl Cpumask {
         *NR_CPU_IDS
     }
 
+    /// Create a Cpumask that is the negation of the current Cpumask.
+    pub fn not(&self) -> Cpumask {
+        let mut new = self.clone();
+        new.mask = !new.mask;
+        new
+    }
+
     /// Create a Cpumask that is the AND of the current Cpumask and another.
     pub fn and(&self, other: &Cpumask) -> Cpumask {
         let mut new = self.clone();
@@ -236,15 +244,33 @@ impl Cpumask {
         new.mask ^= other.mask.clone();
         new
     }
-}
 
-impl Cpumask {
+    /// Iterate over each element of a Cpumask, and return the indices with bits
+    /// set.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use log::info;
+    /// use scx_utils::Cpumask;
+    /// let str = String::from("all");
+    /// let mask = Cpumask::from_str(&str).unwrap();
+    /// for cpu in mask.iter() {
+    ///     info!("cpu {} was set", cpu);
+    /// }
+    /// ```
+    pub fn iter(&self) -> CpumaskIterator {
+        CpumaskIterator {
+            mask: self,
+            index: 0,
+        }
+    }
+
     fn fmt_with(&self, f: &mut fmt::Formatter<'_>, case: char) -> fmt::Result {
         let mut masks: Vec<u32> = self
             .as_raw_slice()
             .iter()
-            .map(|x| [*x as u32, (x >> 32) as u32])
-            .flatten()
+            .flat_map(|x| [*x as u32, (x >> 32) as u32])
             .collect();
 
         // Throw out possible stray from u64 -> u32.
@@ -273,6 +299,28 @@ impl Cpumask {
     }
 }
 
+pub struct CpumaskIterator<'a> {
+    mask: &'a Cpumask,
+    index: usize,
+}
+
+impl Iterator for CpumaskIterator<'_> {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.index < *NR_CPU_IDS {
+            let index = self.index;
+            self.index += 1;
+            let bit_val = self.mask.test_cpu(index);
+            if bit_val {
+                return Some(index);
+            }
+        }
+
+        None
+    }
+}
+
 impl fmt::Display for Cpumask {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.fmt_with(f, 'x')
@@ -291,89 +339,20 @@ impl fmt::UpperHex for Cpumask {
     }
 }
 
-impl BitAnd for Cpumask {
-    type Output = Self;
-    fn bitand(self, rhs: Self) -> Self {
-        self.and(&rhs)
-    }
-}
-
-impl BitAndAssign for Cpumask {
-    fn bitand_assign(&mut self, rhs: Cpumask) {
+impl BitAndAssign<&Self> for Cpumask {
+    fn bitand_assign(&mut self, rhs: &Self) {
         self.mask &= &rhs.mask;
     }
 }
 
-impl BitOr for Cpumask {
-    type Output = Self;
-    fn bitor(self, rhs: Self) -> Self {
-        self.or(&rhs)
-    }
-}
-
-impl BitOrAssign for Cpumask {
-    fn bitor_assign(&mut self, rhs: Cpumask) {
+impl BitOrAssign<&Self> for Cpumask {
+    fn bitor_assign(&mut self, rhs: &Self) {
         self.mask |= &rhs.mask;
     }
 }
 
-impl BitXor for Cpumask {
-    type Output = Self;
-    fn bitxor(self, rhs: Self) -> Self {
-        self.xor(&rhs)
-    }
-}
-
-impl BitXorAssign for Cpumask {
-    fn bitxor_assign(&mut self, rhs: Cpumask) {
+impl BitXorAssign<&Self> for Cpumask {
+    fn bitxor_assign(&mut self, rhs: &Self) {
         self.mask ^= &rhs.mask;
-    }
-}
-
-pub struct CpumaskIntoIterator {
-    mask: Cpumask,
-    index: usize,
-}
-
-/// Iterate over each element of a Cpumask, and return the indices with bits
-/// set.
-///
-/// # Examples
-///
-/// ```rust
-/// use log::info;
-/// use scx_utils::Cpumask;
-/// let str = String::from("all");
-/// let mask = Cpumask::from_str(&str).unwrap();
-/// for cpu in mask.clone().into_iter() {
-///     info!("cpu {} was set", cpu);
-/// }
-/// ```
-impl IntoIterator for Cpumask {
-    type Item = usize;
-    type IntoIter = CpumaskIntoIterator;
-
-    fn into_iter(self) -> CpumaskIntoIterator {
-        CpumaskIntoIterator {
-            mask: self,
-            index: 0,
-        }
-    }
-}
-
-impl Iterator for CpumaskIntoIterator {
-    type Item = usize;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        while self.index < *NR_CPU_IDS {
-            let index = self.index;
-            self.index += 1;
-            let bit_val = self.mask.test_cpu(index);
-            if bit_val {
-                return Some(index);
-            }
-        }
-
-        None
     }
 }

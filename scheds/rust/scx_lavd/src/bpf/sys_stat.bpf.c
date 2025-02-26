@@ -36,15 +36,13 @@ struct sys_stat_ctx {
 	s32		avg_lat_cri;
 	u64		sum_lat_cri;
 	u32		nr_sched;
-	u32		nr_migration;
-	u32		nr_preemption;
-	u32		nr_greedy;
 	u32		nr_perf_cri;
 	u32		nr_lat_cri;
+	u32		nr_x_migration;
+	u32		nr_stealee;
 	u32		nr_big;
 	u32		nr_pc_on_big;
 	u32		nr_lc_on_big;
-	u64		nr_lhp;
 	u64		min_perf_cri;
 	u64		avg_perf_cri;
 	u64		max_perf_cri;
@@ -56,20 +54,76 @@ struct sys_stat_ctx {
 
 static void init_sys_stat_ctx(struct sys_stat_ctx *c)
 {
-	memset(c, 0, sizeof(*c));
+	__builtin_memset(c, 0, sizeof(*c));
 
 	c->stat_cur = get_sys_stat_cur();
 	c->stat_next = get_sys_stat_next();
 	c->min_perf_cri = 1000;
-	c->now = bpf_ktime_get_ns();
+	c->now = scx_bpf_now();
 	c->duration = c->now - c->stat_cur->last_update_clk;
 	c->stat_next->last_update_clk = c->now;
 }
 
+static void plan_x_cpdom_migration(struct sys_stat_ctx *c)
+{
+	struct cpdom_ctx *cpdomc;
+	u64 dsq_id;
+	u32 avg_nr_q_tasks_per_cpu = 0, nr_q_tasks, x_mig_delta;
+	u32 stealer_threshold, stealee_threshold;
+
+	/*
+	 * Calcualte average queued tasks per CPU per compute domain.
+	 */
+	bpf_for(dsq_id, 0, nr_cpdoms) {
+		if (dsq_id >= LAVD_CPDOM_MAX_NR)
+			break;
+
+		nr_q_tasks = scx_bpf_dsq_nr_queued(dsq_id);
+		c->nr_queued_task += nr_q_tasks;
+
+		cpdomc = MEMBER_VPTR(cpdom_ctxs, [dsq_id]);
+		cpdomc->nr_q_tasks_per_cpu = (nr_q_tasks * 1000) / cpdomc->nr_cpus;
+		avg_nr_q_tasks_per_cpu += cpdomc->nr_q_tasks_per_cpu;
+	}
+	avg_nr_q_tasks_per_cpu /= nr_cpdoms;
+
+	/*
+	 * Determine stealer and stealee domains.
+	 *
+	 * A stealer domain, whose per-CPU queue length is shorter than
+	 * the average, will steal a task from any of stealee domain,
+	 * whose per-CPU queue length is longer than the average.
+	 * Compute domain around average will not do anything.
+	 */
+	x_mig_delta = avg_nr_q_tasks_per_cpu >> LAVD_CPDOM_MIGRATION_SHIFT;
+	stealer_threshold = avg_nr_q_tasks_per_cpu - x_mig_delta;
+	stealee_threshold = avg_nr_q_tasks_per_cpu + x_mig_delta;
+
+	bpf_for(dsq_id, 0, nr_cpdoms) {
+		if (dsq_id >= LAVD_CPDOM_MAX_NR)
+			break;
+
+		cpdomc = MEMBER_VPTR(cpdom_ctxs, [dsq_id]);
+
+		if (cpdomc->nr_q_tasks_per_cpu < stealer_threshold) {
+			WRITE_ONCE(cpdomc->is_stealer, true);
+			WRITE_ONCE(cpdomc->is_stealee, false);
+		}
+		else if (cpdomc->nr_q_tasks_per_cpu > stealee_threshold) {
+			WRITE_ONCE(cpdomc->is_stealer, false);
+			WRITE_ONCE(cpdomc->is_stealee, true);
+			c->nr_stealee++;
+		}
+		else {
+			WRITE_ONCE(cpdomc->is_stealer, false);
+			WRITE_ONCE(cpdomc->is_stealee, false);
+		}
+	}
+}
+
 static void collect_sys_stat(struct sys_stat_ctx *c)
 {
-	u64 dsq_id;
-	int cpu, nr;
+	int cpu;
 
 	bpf_for(cpu, 0, nr_cpu_ids) {
 		struct cpu_ctx *cpuc = get_cpu_ctx_id(cpu);
@@ -98,17 +152,8 @@ static void collect_sys_stat(struct sys_stat_ctx *c)
 		c->nr_lat_cri += cpuc->nr_lat_cri;
 		cpuc->nr_lat_cri = 0;
 
-		c->nr_migration += cpuc->nr_migration;
-		cpuc->nr_migration = 0;
-
-		c->nr_preemption += cpuc->nr_preemption;
-		cpuc->nr_preemption = 0;
-
-		c->nr_greedy += cpuc->nr_greedy;
-		cpuc->nr_greedy = 0;
-
-		c->nr_lhp += cpuc->nr_lhp;
-		cpuc->nr_lhp = 0;
+		c->nr_x_migration += cpuc->nr_x_migration;
+		cpuc->nr_x_migration = 0;
 
 		/*
 		 * Accumulate task's latency criticlity information.
@@ -130,16 +175,18 @@ static void collect_sys_stat(struct sys_stat_ctx *c)
 		/*
 		 * Accumulate task's performance criticlity information.
 		 */
-		if (cpuc->min_perf_cri < c->min_perf_cri)
-			c->min_perf_cri = cpuc->min_perf_cri;
-		cpuc->min_perf_cri = 1000;
+		if (have_little_core) {
+			if (cpuc->min_perf_cri < c->min_perf_cri)
+				c->min_perf_cri = cpuc->min_perf_cri;
+			cpuc->min_perf_cri = 1000;
 
-		if (cpuc->max_perf_cri > c->max_perf_cri)
-			c->max_perf_cri = cpuc->max_perf_cri;
-		cpuc->max_perf_cri = 0;
+			if (cpuc->max_perf_cri > c->max_perf_cri)
+				c->max_perf_cri = cpuc->max_perf_cri;
+			cpuc->max_perf_cri = 0;
 
-		c->sum_perf_cri += cpuc->sum_perf_cri;
-		cpuc->sum_perf_cri = 0;
+			c->sum_perf_cri += cpuc->sum_perf_cri;
+			cpuc->sum_perf_cri = 0;
+		}
 
 		/*
 		 * If the CPU is in an idle state (i.e., idle_start_clk is
@@ -153,7 +200,7 @@ static void collect_sys_stat(struct sys_stat_ctx *c)
 			bool ret = __sync_bool_compare_and_swap(
 					&cpuc->idle_start_clk, old_clk, c->now);
 			if (ret) {
-				cpuc->idle_total += c->now - old_clk;
+				cpuc->idle_total += time_delta(c->now, old_clk);
 				break;
 			}
 		}
@@ -183,12 +230,6 @@ static void collect_sys_stat(struct sys_stat_ctx *c)
 		c->idle_total += cpuc->idle_total;
 		cpuc->idle_total = 0;
 	}
- 
-	bpf_for(dsq_id, 0, LAVD_CPDOM_MAX_NR) {
-		nr = scx_bpf_dsq_nr_queued(dsq_id);
-		if (nr > 0)
-			c->nr_queued_task += nr;
-	}
 }
 
 static void calc_sys_stat(struct sys_stat_ctx *c)
@@ -208,13 +249,16 @@ static void calc_sys_stat(struct sys_stat_ctx *c)
 		c->max_lat_cri = c->stat_cur->max_lat_cri;
 		c->avg_lat_cri = c->stat_cur->avg_lat_cri;
 
-		c->min_perf_cri = c->stat_cur->min_perf_cri;
-		c->max_perf_cri = c->stat_cur->max_perf_cri;
-		c->avg_perf_cri = c->stat_cur->avg_perf_cri;
+		if (have_little_core) {
+			c->min_perf_cri = c->stat_cur->min_perf_cri;
+			c->max_perf_cri = c->stat_cur->max_perf_cri;
+			c->avg_perf_cri = c->stat_cur->avg_perf_cri;
+		}
 	}
 	else {
 		c->avg_lat_cri = c->sum_lat_cri / c->nr_sched;
-		c->avg_perf_cri = c->sum_perf_cri / c->nr_sched;
+		if (have_little_core)
+			c->avg_perf_cri = c->sum_perf_cri / c->nr_sched;
 	}
 }
 
@@ -239,14 +283,18 @@ static void update_sys_stat_next(struct sys_stat_ctx *c)
 	stat_next->thr_lat_cri = stat_next->max_lat_cri -
 		((stat_next->max_lat_cri - stat_next->avg_lat_cri) >> 1);
 
-	stat_next->min_perf_cri =
-		calc_avg32(stat_cur->min_perf_cri, c->min_perf_cri);
-	stat_next->avg_perf_cri =
-		calc_avg32(stat_cur->avg_perf_cri, c->avg_perf_cri);
-	stat_next->max_perf_cri =
-		calc_avg32(stat_cur->max_perf_cri, c->max_perf_cri);
-	stat_next->thr_perf_cri =
-		c->stat_cur->thr_perf_cri; /* will be updated later */
+	if (have_little_core) {
+		stat_next->min_perf_cri =
+			calc_avg32(stat_cur->min_perf_cri, c->min_perf_cri);
+		stat_next->avg_perf_cri =
+			calc_avg32(stat_cur->avg_perf_cri, c->avg_perf_cri);
+		stat_next->max_perf_cri =
+			calc_avg32(stat_cur->max_perf_cri, c->max_perf_cri);
+		stat_next->thr_perf_cri =
+			c->stat_cur->thr_perf_cri; /* will be updated later */
+	}
+
+	stat_next->nr_stealee = c->nr_stealee;
 
 	stat_next->nr_violation =
 		calc_avg32(stat_cur->nr_violation, c->nr_violation);
@@ -267,15 +315,12 @@ static void update_sys_stat_next(struct sys_stat_ctx *c)
 	if (cnt++ == LAVD_SYS_STAT_DECAY_TIMES) {
 		cnt = 0;
 		stat_next->nr_sched >>= 1;
-		stat_next->nr_migration >>= 1;
-		stat_next->nr_preemption >>= 1;
-		stat_next->nr_greedy >>= 1;
 		stat_next->nr_perf_cri >>= 1;
 		stat_next->nr_lat_cri >>= 1;
+		stat_next->nr_x_migration >>= 1;
 		stat_next->nr_big >>= 1;
 		stat_next->nr_pc_on_big >>= 1;
 		stat_next->nr_lc_on_big >>= 1;
-		stat_next->nr_lhp >>= 1;
 
 		__sync_fetch_and_sub(&performance_mode_ns, performance_mode_ns/2);
 		__sync_fetch_and_sub(&balanced_mode_ns, balanced_mode_ns/2);
@@ -283,15 +328,12 @@ static void update_sys_stat_next(struct sys_stat_ctx *c)
 	}
 
 	stat_next->nr_sched += c->nr_sched;
-	stat_next->nr_migration += c->nr_migration;
-	stat_next->nr_preemption += c->nr_preemption;
-	stat_next->nr_greedy += c->nr_greedy;
 	stat_next->nr_perf_cri += c->nr_perf_cri;
 	stat_next->nr_lat_cri += c->nr_lat_cri;
+	stat_next->nr_x_migration += c->nr_x_migration;
 	stat_next->nr_big += c->nr_big;
 	stat_next->nr_pc_on_big += c->nr_pc_on_big;
 	stat_next->nr_lc_on_big += c->nr_lc_on_big;
-	stat_next->nr_lhp += c->nr_lhp;
 
 	update_power_mode_time();
 }
@@ -304,6 +346,7 @@ static void do_update_sys_stat(void)
 	 * Collect and prepare the next version of stat.
 	 */
 	init_sys_stat_ctx(&c);
+	plan_x_cpdom_migration(&c);
 	collect_sys_stat(&c);
 	calc_sys_stat(&c);
 	update_sys_stat_next(&c);
@@ -351,7 +394,7 @@ static s32 init_sys_stat(u64 now)
 	u32 key = 0;
 	int err;
 
-	memset(__sys_stats, 0, sizeof(__sys_stats));
+	__builtin_memset(__sys_stats, 0, sizeof(__sys_stats));
 	__sys_stats[0].last_update_clk = now;
 	__sys_stats[1].last_update_clk = now;
 	__sys_stats[0].nr_active = nr_cpus_big;

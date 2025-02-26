@@ -48,7 +48,9 @@ use log::info;
 use scx_stats::prelude::*;
 use scx_utils::build_id;
 use scx_utils::compat;
+use scx_utils::import_enums;
 use scx_utils::init_libbpf_logging;
+use scx_utils::scx_enums;
 use scx_utils::scx_ops_attach;
 use scx_utils::scx_ops_load;
 use scx_utils::scx_ops_open;
@@ -223,6 +225,12 @@ struct Opts {
     /// Show descriptions for statistics.
     #[clap(long)]
     help_stats: bool,
+
+    /// Tunable for prioritizing CPU performance by configuring the CPU frequency governor.
+    /// Valid values are [0, 1024]. Higher values prioritize performance, lower values
+    /// prioritize energy efficiency. When in doubt, use 0 or 1024.
+    #[clap(long, default_value = "0")]
+    perf: u32,
 }
 
 fn read_cpu_busy_and_total(reader: &procfs::ProcReader) -> Result<(u64, u64)> {
@@ -254,11 +262,7 @@ fn read_cpu_busy_and_total(reader: &procfs::ProcReader) -> Result<(u64, u64)> {
 }
 
 pub fn sub_or_zero(curr: &u64, prev: &u64) -> u64 {
-    if let Some(res) = curr.checked_sub(*prev) {
-        res
-    } else {
-        0
-    }
+    curr.checked_sub(*prev).unwrap_or(0u64)
 }
 
 #[derive(Clone, Debug)]
@@ -345,7 +349,6 @@ struct Scheduler<'a> {
     lb_at: SystemTime,
     lb_stats: BTreeMap<usize, NodeStats>,
     time_used: Duration,
-    nr_lb_data_errors: u64,
 
     tuner: Tuner,
     stats_server: StatsServer<StatsCtx, (StatsCtx, ClusterStats)>,
@@ -359,7 +362,7 @@ impl<'a> Scheduler<'a> {
         init_libbpf_logging(None);
         info!(
             "Running scx_rusty (build ID: {})",
-            *build_id::SCX_FULL_VERSION
+            build_id::full_version(env!("CARGO_PKG_VERSION"))
         );
         let mut skel = scx_ops_open!(skel_builder, open_object, rusty).unwrap();
 
@@ -382,6 +385,8 @@ impl<'a> Scheduler<'a> {
             );
         }
 
+        skel.maps.bss_data.slice_ns = scx_enums.SCX_SLICE_DFL;
+
         skel.maps.rodata_data.nr_nodes = domains.nr_nodes() as u32;
         skel.maps.rodata_data.nr_doms = domains.nr_doms() as u32;
         skel.maps.rodata_data.nr_cpu_ids = *NR_CPU_IDS as u32;
@@ -395,7 +400,7 @@ impl<'a> Scheduler<'a> {
         }
 
         for (id, dom) in domains.doms().iter() {
-            for cpu in dom.mask().into_iter() {
+            for cpu in dom.mask().iter() {
                 skel.maps.rodata_data.cpu_dom_id_map[cpu] = id
                     .clone()
                     .try_into()
@@ -404,7 +409,7 @@ impl<'a> Scheduler<'a> {
         }
 
         for numa in 0..domains.nr_nodes() {
-            let mut numa_mask = Cpumask::new()?;
+            let mut numa_mask = Cpumask::new();
             let node_domains = domains.numa_doms(&numa);
             for dom in node_domains.iter() {
                 let dom_mask = dom.mask();
@@ -442,11 +447,23 @@ impl<'a> Scheduler<'a> {
         skel.maps.rodata_data.direct_greedy_numa = opts.direct_greedy_numa;
         skel.maps.rodata_data.mempolicy_affinity = opts.mempolicy_affinity;
         skel.maps.rodata_data.debug = opts.verbose as u32;
+        skel.maps.rodata_data.rusty_perf_mode = opts.perf;
 
         // Attach.
         let mut skel = scx_ops_load!(skel, rusty, uei)?;
         let struct_ops = Some(scx_ops_attach!(skel, rusty)?);
         let stats_server = StatsServer::new(stats::server_data()).launch()?;
+
+        for (id, dom) in domains.doms().iter() {
+            let id: usize = id
+                .clone()
+                .try_into()
+                .expect("Could not turn domain ID into usize");
+
+            let mut ctx = dom.ctx.lock().unwrap();
+
+            *ctx = Some(skel.maps.bss_data.dom_ctxs[id]);
+        }
 
         info!("Rusty scheduler started! Run `scx_rusty --monitor` for metrics.");
 
@@ -468,7 +485,6 @@ impl<'a> Scheduler<'a> {
             lb_at: SystemTime::now(),
             lb_stats: BTreeMap::new(),
             time_used: Duration::default(),
-            nr_lb_data_errors: 0,
 
             tuner: Tuner::new(
                 domains,
@@ -524,7 +540,6 @@ impl<'a> Scheduler<'a> {
             nr_migrations: sc.bpf_stats[bpf_intf::stat_idx_RUSTY_STAT_LOAD_BALANCE as usize],
 
             task_get_err: sc.bpf_stats[bpf_intf::stat_idx_RUSTY_STAT_TASK_GET_ERR as usize],
-            lb_data_err: self.nr_lb_data_errors,
             time_used: sc.time_used.as_secs_f64(),
 
             sync_prev_idle: stat_pct(bpf_intf::stat_idx_RUSTY_STAT_SYNC_PREV_IDLE),
@@ -612,7 +627,7 @@ impl<'a> Scheduler<'a> {
     }
 }
 
-impl<'a> Drop for Scheduler<'a> {
+impl Drop for Scheduler<'_> {
     fn drop(&mut self) {
         if let Some(struct_ops) = self.struct_ops.take() {
             drop(struct_ops);
@@ -624,7 +639,10 @@ fn main() -> Result<()> {
     let opts = Opts::parse();
 
     if opts.version {
-        println!("scx_rusty: {}", *build_id::SCX_FULL_VERSION);
+        println!(
+            "scx_rusty: {}",
+            build_id::full_version(env!("CARGO_PKG_VERSION"))
+        );
         return Ok(());
     }
 

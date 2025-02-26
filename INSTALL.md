@@ -2,78 +2,65 @@
 
 ## Ubuntu
 
-Experimental sched_ext support for Ubuntu is provided by the following
-launchpad project:
+`sched_ext` support for Ubuntu is currently provided by the linux-unstable
+kernel, available at
+[ppa:canonical-kernel-team/unstable](https://launchpad.net/~canonical-kernel-team/+archive/ubuntu/unstable).
 
- https://launchpad.net/~arighi/+archive/ubuntu/sched-ext
+#### Upgrading to 25.04 (Plucky Puffin) - recommended
 
-#### Upgrading to 24.04 (NobleNumbat)
-
-Currently, only the 24.04 release is supported. You can upgrade to 24.04
+Currently, only the 25.04 release is supported. You can upgrade to 25.04
 using the following command:
 
 ```
 $ sudo do-release-upgrade -d
 ```
 
-#### Installing the Kernel and Schedulers
+#### Enable ppa:canonical-kernel-team/unstable
 
 ```
-$ sudo add-apt-repository -y --enable-source ppa:arighi/sched-ext
-$ sudo apt install -y linux-generic-wip scx
+$ sudo add-apt-repository -y --enable-source ppa:canonical-kernel-team/unstable
+```
+
+If you are **not** on Ubuntu 25.04, make sure to select `plucky` as the release
+for the linux-unstable ppa:
+```
+$ sudo sed -i "s/^Suites: .*/Suites: plucky/" \
+  /etc/apt/sources.list.d/canonical-kernel-team-ubuntu-unstable-plucky.sources
+```
+
+#### Installing the linux-unstable Kernel
+
+```
+$ sudo apt install -y linux-generic-wip
 $ sudo reboot
 ```
-
-After the reboot, the scheduler binaries in `/usr/sbin/scx_*` should be usable.
-Note: they must be called with `sudo` like other BPF programs e.g. `sudo scx_simple`.
 
 #### Setting up Dev Environment
 
 ```
-$ apt source scx
-$ sudo apt build-dep scx
+$ sudo apt install -y build-essential meson cmake cargo rustc clang llvm pkg-config libelf-dev
+```
+
+#### Build the scx schedulers from source
+
+```
+$ git clone https://github.com/sched-ext/scx.git
+$ cd scx
+$ meson setup build
+$ meson compile -C build
+```
+
+#### Install the scx schedulers from source
+
+```
+$ meson install -C build
 ```
 
 ## Arch Linux
 
-Import the gpg key. This can be skipped if the signature checking is disabled.
-
 ```
-$ sudo pacman-key --recv-keys F3B607488DB35A47 --keyserver keyserver.ubuntu.com
-$ sudo pacman-key --lsign-key F3B607488DB35A47
+sudo pacman -S scx-scheds
 ```
-
-If you haven't imported the GPG key, append the following line.
-
-```
-SigLevel = Never
-```
-
-#### Adding the Repository
-
-Install packages with a list of mirrors and GPG keys
-
-```
-$ sudo pacman -U 'https://mirror.cachyos.org/repo/x86_64/cachyos/cachyos-keyring-20240331-1-any.pkg.tar.zst' 'https://mirror.cachyos.org/repo/x86_64/cachyos/cachyos-mirrorlist-18-1-any.pkg.tar.zst'
-```
-
-Add the following custom repository section to `/etc/pacman.conf`.
-
-```
-# cachyos repos
-[cachyos]
-Include = /etc/pacman.d/cachyos-mirrorlist
-```
-
-#### Installing the Kernel and Schedulers
-
-```
-$ sudo pacman -Sy cachyos/linux-sched-ext cachyos/linux-sched-ext-headers cachyos/scx-scheds
-```
-
-:warning: The kernel installs as `/boot/vmlinuz-linux-sched-ext` along with
-the matching initramfs. Update the bootloader configuration to add the boot
-entry for the new kernel.
 
 #### Setting Up Dev Environment
 
@@ -83,20 +70,12 @@ In addition to the packages from the previous step, install the following.
 $ sudo pacman -Sy meson cargo bpf pahole
 ```
 
-#### Using Debug Kernel
-
-CachyOS does provide a kernel with an unstripped vmlinux, which can be used for debugging.
-
-```
-$ sudo pacman -Sy linux-cachyos-sched-ext-debug linux-cachyos-sched-ext-debug-headers
-```
-
-## Gentoo
+## Gentoo Linux
 Make sure you build the kernel with the right configuration, installation
 should be easy:
 ```
 echo 'sys-kernel/scx ~amd64' >> /etc/portage/package.accept_keywords
-emerge sys-kernel/scx ~amd64
+emerge sys-kernel/scx
 ```
 
 ## Fedora
@@ -131,68 +110,25 @@ No additional steps needed here other than what is mentioned in the main README.
 
 ## Nix
 
-[Chaotic Nyx](https://github.com/chaotic-cx/nyx) is maintaining the linux-cachyos kernel and scx-scheds package in a flake.
+From NixOS 24.11 onwards, `scx` is available on Nixpkgs. Using a kernel of version 6.12+ or later is required.
 
-#### Integrate the repository using flake
-
-<pre lang="nix"><code class="language-nix">
+```nix
 {
-  description = "My configuration";
-
-  inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    chaotic.url = "github:chaotic-cx/nyx/nyxpkgs-unstable";
-  };
-
-  outputs = { nixpkgs, chaotic, ... }: {
-    nixosConfigurations = {
-      hostname = nixpkgs.lib.nixosSystem {
-        system = "x86_64-linux";
-        modules = [
-          ./configuration.nix # Your system configuration.
-          chaotic.nixosModules.default # OUR DEFAULT MODULE
-        ];
-      };
-    };
-  };
+  services.scx.enable = true;
+  services.scx.scheduler = "scx_lavd"; # default is "scx_rustland"
+  boot.kernelPackages = pkgs.linuxPackages_latest;
 }
-</code></pre>
+```
 
-#### Add this to your configuration to install the kernel
+Then rebuild and reboot your system. You can check if the scheduler is running by:
 
-<pre lang="nix"><code class="language-nix">
-{
-  boot.kernelPackages = pkgs.linuxPackages_cachyos;
-  environment.systemPackages =  [ pkgs.scx ];
-}
-</code></pre>
-
-Then install the package and reboot your system. After you can use all provided example schedulers.
+```shell
+  systemctl status scx.service
+```
 
 ## openSUSE Tumbleweed
 
-Experimental sched_ext support for openSUSE Tumbleweed is provided by the following
-OBS project:
-
- https://build.opensuse.org/project/show/home:flonnegren:sched-ext
-
-#### Adding the Repository
-
-Add the home:flonnegren:sched-ext repository using:
-
-```
-$ sudo zypper addrepo --name sched-ext --refresh --enable https://download.opensuse.org/repositories/home:flonnegren:sched-ext/standard/home:flonnegren:sched-ext.repo
-$ sudo zypper refresh
-```
-
-#### Installing the Kernel
-
-```
-$ sudo zypper install --repo sched-ext --force kernel-default
-$ sudo reboot
-```
-
-Then the new kernel should be booted by default.
+The scx package is included in openSUSE Factory and can be installed directly from Tumbleweed.
 
 #### Installing the Schedulers
 
@@ -200,6 +136,7 @@ All schedulers are provided in the scx package
 
 Example:
 ```
+
 $ sudo zypper install scx
 $ sudo scx_rusty
 ```
@@ -207,4 +144,3 @@ $ sudo scx_rusty
 #### Setting up Dev Environment
 
 No additional steps needed here other than what is mentioned in the main README.md.
-

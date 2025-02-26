@@ -14,7 +14,11 @@ use std::slice::from_raw_parts;
 
 lazy_static::lazy_static! {
     pub static ref SCX_OPS_SWITCH_PARTIAL: u64 =
-    read_enum("scx_ops_flags", "SCX_OPS_SWITCH_PARTIAL").unwrap_or(0);
+        read_enum("scx_ops_flags", "SCX_OPS_SWITCH_PARTIAL").unwrap_or(0);
+    pub static ref SCX_OPS_ALLOW_QUEUED_WAKEUP: u64 =
+        read_enum("scx_ops_flags", "SCX_OPS_ALLOW_QUEUED_WAKEUP").unwrap_or(0);
+    pub static ref SCX_OPS_ENQ_MIGRATION_DISABLED: u64 =
+        read_enum("scx_ops_flags", "SCX_OPS_ENQ_MIGRATION_DISABLED").unwrap_or(0);
 }
 
 fn load_vmlinux_btf() -> &'static mut btf {
@@ -124,7 +128,7 @@ pub fn struct_has_field(type_name: &str, field: &str) -> Result<bool> {
         }
     }
 
-    return Ok(false);
+    Ok(false)
 }
 
 pub fn ksym_exists(ksym: &str) -> Result<bool> {
@@ -203,7 +207,10 @@ macro_rules! scx_ops_open {
                 }
             };
 
+            import_enums!(skel);
+
             let result : Result<OpenBpfSkel<'_>, anyhow::Error> = Ok(skel);
+
             result
         }
     }};

@@ -53,11 +53,10 @@ enum {
 	LAVD_CPDOM_MAX_NR		= 32, /* maximum number of compute domain */
 	LAVD_CPDOM_MAX_DIST		= 4,  /* maximum distance from one compute domain to another */
 
-	LAVD_STATUS_STR_LEN		= 5, /* {LR: Latency-critical, Regular}
+	LAVD_STATUS_STR_LEN		= 4, /* {LR: Latency-critical, Regular}
 						{HI: performance-Hungry, performance-Insensitive}
 						{BT: Big, liTtle}
-						{EG: Eligible, Greedy}
-						{PN: Preemption, Not} */
+						{EG: Eligible, Greedy} */
 };
 
 /*
@@ -79,20 +78,17 @@ struct sys_stat {
 	volatile u32	max_perf_cri;	/* maximum performance criticality */
 	volatile u32	thr_perf_cri;	/* performance criticality threshold */
 
+	volatile u32	nr_stealee;	/* number of compute domains to be migrated */
 	volatile u32	nr_violation;	/* number of utilization violation */
 	volatile u32	nr_active;	/* number of active cores */
 
 	volatile u64	nr_sched;	/* total scheduling so far */
-	volatile u64	nr_migration;	/* number of task migration */
-	volatile u64	nr_preemption;	/* number of preemption */
-	volatile u64	nr_greedy;	/* number of greedy tasks scheduled */
 	volatile u64	nr_perf_cri;	/* number of performance-critical tasks scheduled */
 	volatile u64	nr_lat_cri;	/* number of latency-critical tasks scheduled */
+	volatile u64	nr_x_migration; /* number of cross domain migration */
 	volatile u64	nr_big;		/* scheduled on big core */
 	volatile u64	nr_pc_on_big;	/* performance-critical tasks scheduled on big core */
 	volatile u64	nr_lc_on_big;	/* latency-critical tasks scheduled on big core */
-
-	volatile u64	nr_lhp;		/* number of lock holder preemption */
 };
 
 /*
@@ -114,39 +110,25 @@ struct task_ctx {
 	u64	run_time_ns;		/* average runtime per schedule */
 	u64	run_freq;		/* scheduling frequency in a second */
 	u64	wait_freq;		/* waiting frequency in a second */
-
 	u64	wake_freq;		/* waking-up frequency in a second */
 	u64	svc_time;		/* total CPU time consumed for this task */
 
 	/*
 	 * Task deadline and time slice
 	 */
-	u64	vdeadline_log_clk;	/* logical clock of the deadilne */
-	u64	vdeadline_delta_ns;	/* time delta until task's virtual deadline */
-	u64	slice_ns;		/* time slice */
-	u32	greedy_ratio;		/* task's overscheduling ratio compared to its nice priority */
+	u32	*futex_uaddr;		/* futex uaddr */
 	u32	lat_cri;		/* final context-aware latency criticality */
-	u32	lat_cri_self;		/* my latency criticality */
 	u32	lat_cri_waker;		/* waker's latency criticality */
-	volatile s32 victim_cpu;
-	u16	slice_boost_prio;	/* how many times a task fully consumed the slice */
-	volatile s16 lock_boost;	/* lock boost count */
-	volatile s16 futex_boost;	/* futex boost count */
-	volatile u8 need_lock_boost;	/* need to boost lock for deadline calculation */
+	u32	perf_cri;		/* performance criticality of a task */
+	u32	slice_ns;		/* time slice */
+	s8	futex_boost;		/* futex boost count */
+	u8	is_greedy;		/* task's overscheduling ratio compared to its nice priority */
+	u8	need_lock_boost;	/* need to boost lock for deadline calculation */
+	u8	lock_holder_xted;	/* slice is already extended for a lock holder task */
 	u8	wakeup_ft;		/* regular wakeup = 1, sync wakeup = 2 */
-	volatile u32 *futex_uaddr;	/* futex uaddr */
-
-	/*
-	 * Task's performance criticality
-	 */
+	u8	slice_boost_prio;	/* how many times a task fully consumed the slice */
 	u8	on_big;			/* executable on a big core */
 	u8	on_little;		/* executable on a little core */
-	u32	perf_cri;		/* performance criticality of a task */
-
-	/*
-	 * Information for statistics collection
-	 */
-	u32	cpu_id;			/* CPU ID scheduled on */
 };
 
 /*

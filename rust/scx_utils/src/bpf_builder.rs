@@ -9,6 +9,7 @@ use anyhow::Context;
 use anyhow::Result;
 use glob::glob;
 use libbpf_cargo::SkeletonBuilder;
+use libbpf_rs::Linker;
 use std::collections::BTreeSet;
 use std::env;
 use std::path::Path;
@@ -185,10 +186,10 @@ pub struct BpfBuilder {
     clang: ClangInfo,
     cflags: Vec<String>,
     out_dir: PathBuf,
+    sources: BTreeSet<String>,
 
     intf_input_output: Option<(String, String)>,
     skel_input_name: Option<(String, String)>,
-    skel_deps: Option<Vec<String>>,
 }
 
 impl BpfBuilder {
@@ -227,12 +228,12 @@ impl BpfBuilder {
             _ => vec![],
         });
 
-        cflags.push(format!("-I{}", &bpf_h));
         cflags.push(format!(
             "-I{}/arch/{}",
             &bpf_h,
             &clang.kernel_target().unwrap()
         ));
+        cflags.push(format!("-I{}", &bpf_h));
         cflags.push(format!("-I{}/bpf-compat", &bpf_h));
 
         cflags.append(&mut match env::var("BPF_EXTRA_CFLAGS_POST_INCL") {
@@ -262,9 +263,9 @@ impl BpfBuilder {
             cflags,
             out_dir,
 
+            sources: BTreeSet::new(),
             intf_input_output: None,
             skel_input_name: None,
-            skel_deps: None,
         })
     }
 
@@ -282,37 +283,27 @@ impl BpfBuilder {
     /// source code and `@output` is the `.rs` file to be generated.
     pub fn enable_skel(&mut self, input: &str, name: &str) -> &mut Self {
         self.skel_input_name = Some((input.into(), name.into()));
+        self.sources.insert(input.into());
+
         self
     }
 
-    /// By default, all `.[hc]` files in the same directory as the source
-    /// BPF `.c` file are treated as dependencies and the skeleton is
-    /// regenerated if any has changed. This method replaces the automatic
-    /// dependencies with `@deps`.
-    pub fn set_skel_deps<'a, I>(&mut self, deps: I) -> &mut Self
-    where
-        I: IntoIterator<Item = &'a str>,
-    {
-        self.skel_deps = Some(deps.into_iter().map(|d| d.to_string()).collect());
-        self
+    fn input_insert_deps(&self, deps: &mut BTreeSet<String>) -> () {
+        let (input, _) = match &self.intf_input_output {
+            Some(pair) => pair,
+            None => return,
+        };
+
+        // Tell cargo to invalidate the built crate whenever the wrapper changes
+        deps.insert(input.to_string());
     }
 
-    fn bindgen_bpf_intf(&self, deps: &mut BTreeSet<String>) -> Result<()> {
+    fn bindgen_bpf_intf(&self) -> Result<()> {
         let (input, output) = match &self.intf_input_output {
             Some(pair) => pair,
             None => return Ok(()),
         };
 
-        // Tell cargo to invalidate the built crate whenever the wrapper changes
-        deps.insert(input.to_string());
-
-        // FIXME - bindgen's API changed between 0.68 and 0.69 so that
-        // `bindgen::CargoCallbacks::new()` should be used instead of
-        // `bindgen::CargoCallbacks`. Unfortunately, as of Dec 2023, fedora
-        // is shipping 0.68. To accommodate fedora, allow both 0.68 and 0.69
-        // of bindgen and suppress deprecation warning. Remove the following
-        // once fedora can be updated to bindgen >= 0.69.
-        #[allow(deprecated)]
         // The bindgen::Builder is the main entry point to bindgen, and lets
         // you build up options for the resulting bindings.
         let bindings = bindgen::Builder::default()
@@ -326,13 +317,68 @@ impl BpfBuilder {
             .header(input)
             // Tell cargo to invalidate the built crate whenever any of the
             // included header files changed.
-            .parse_callbacks(Box::new(bindgen::CargoCallbacks))
+            .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
             .generate()
             .context("Unable to generate bindings")?;
 
         bindings
             .write_to_file(self.out_dir.join(output))
             .context("Couldn't write bindings")
+    }
+
+    pub fn add_source(&mut self, input: &str) -> &mut Self {
+        self.sources.insert(input.into());
+        self
+    }
+
+    pub fn compile_link_gen(&mut self) -> Result<()> {
+        let (input, name) = match &self.skel_input_name {
+            Some(pair) => pair,
+            None => return Ok(()),
+        };
+
+        let linkobj = self.out_dir.join(format!("{}.bpf.o", name));
+        let mut linker = Linker::new(&linkobj)?;
+
+        for filename in self.sources.iter() {
+            let obj = self.out_dir.join(name.replace(".bpf.c", ".bpf.o"));
+
+            let output = SkeletonBuilder::new()
+                .debug(true)
+                .source(filename)
+                .obj(&obj)
+                .clang(&self.clang.clang)
+                .clang_args(&self.cflags)
+                .build()?;
+
+            for line in String::from_utf8_lossy(output.stderr()).lines() {
+                println!("cargo:warning={}", line);
+            }
+
+            linker.add_file(&obj)?;
+        }
+
+        linker.link()?;
+
+        self.bindgen_bpf_intf()?;
+
+        let skel_path = self.out_dir.join(format!("{}_skel.rs", name));
+
+        SkeletonBuilder::new()
+            .obj(&linkobj)
+            .clang(&self.clang.clang)
+            .clang_args(&self.cflags)
+            .generate(&skel_path)?;
+
+        let mut deps = BTreeSet::new();
+        self.add_src_deps(&mut deps, &input)?;
+        for filename in self.sources.iter() {
+            deps.insert(filename.to_string());
+        }
+
+        self.gen_cargo_reruns(Some(&mut deps))?;
+
+        Ok(())
     }
 
     fn gen_bpf_skel(&self, deps: &mut BTreeSet<String>) -> Result<()> {
@@ -344,36 +390,57 @@ impl BpfBuilder {
         let obj = self.out_dir.join(format!("{}.bpf.o", name));
         let skel_path = self.out_dir.join(format!("{}_skel.rs", name));
 
-        SkeletonBuilder::new()
+        let output = SkeletonBuilder::new()
             .source(input)
             .obj(&obj)
             .clang(&self.clang.clang)
             .clang_args(&self.cflags)
             .build_and_generate(&skel_path)?;
 
-        match &self.skel_deps {
-            Some(skel_deps) => {
-                for path in skel_deps {
-                    deps.insert(path.to_string());
-                }
-            }
-            None => {
-                let c_path = PathBuf::from(input);
-                let dir = c_path
-                    .parent()
-                    .ok_or(anyhow!("Source {:?} doesn't have parent dir", c_path))?
-                    .to_str()
-                    .ok_or(anyhow!("Parent dir of {:?} isn't a UTF-8 string", c_path))?;
-
-                for path in glob(&format!("{}/*.[hc]", dir))?.filter_map(Result::ok) {
-                    deps.insert(
-                        path.to_str()
-                            .ok_or(anyhow!("Path {:?} is not a valid string", path))?
-                            .to_string(),
-                    );
-                }
-            }
+        for line in String::from_utf8_lossy(output.stderr()).lines() {
+            println!("cargo:warning={}", line);
         }
+
+        self.add_src_deps(deps, &input)?;
+
+        Ok(())
+    }
+
+    fn add_src_deps(&self, deps: &mut BTreeSet<String>, input: &str) -> Result<()> {
+        let c_path = PathBuf::from(input);
+        let dir = c_path
+            .parent()
+            .ok_or(anyhow!("Source {:?} doesn't have parent dir", c_path))?
+            .to_str()
+            .ok_or(anyhow!("Parent dir of {:?} isn't a UTF-8 string", c_path))?;
+
+        for path in glob(&format!("{}/*.[hc]", dir))?.filter_map(Result::ok) {
+            deps.insert(
+                path.to_str()
+                    .ok_or(anyhow!("Path {:?} is not a valid string", path))?
+                    .to_string(),
+            );
+        }
+
+        Ok(())
+    }
+
+    fn gen_cargo_reruns(&self, dependencies: Option<&BTreeSet<String>>) -> Result<()> {
+        println!("cargo:rerun-if-env-changed=BPF_CLANG");
+        println!("cargo:rerun-if-env-changed=BPF_CFLAGS");
+        println!("cargo:rerun-if-env-changed=BPF_BASE_CFLAGS");
+        println!("cargo:rerun-if-env-changed=BPF_EXTRA_CFLAGS_PRE_INCL");
+        println!("cargo:rerun-if-env-changed=BPF_EXTRA_CFLAGS_POST_INCL");
+        if let Some(deps) = dependencies {
+            for dep in deps.iter() {
+                println!("cargo:rerun-if-changed={}", dep);
+            }
+        };
+
+        for source in self.sources.iter() {
+            println!("cargo:rerun-if-changed={}", source);
+        }
+
         Ok(())
     }
 
@@ -381,17 +448,11 @@ impl BpfBuilder {
     pub fn build(&self) -> Result<()> {
         let mut deps = BTreeSet::new();
 
-        self.bindgen_bpf_intf(&mut deps)?;
-        self.gen_bpf_skel(&mut deps)?;
+        self.input_insert_deps(&mut deps);
 
-        println!("cargo:rerun-if-env-changed=BPF_CLANG");
-        println!("cargo:rerun-if-env-changed=BPF_CFLAGS");
-        println!("cargo:rerun-if-env-changed=BPF_BASE_CFLAGS");
-        println!("cargo:rerun-if-env-changed=BPF_EXTRA_CFLAGS_PRE_INCL");
-        println!("cargo:rerun-if-env-changed=BPF_EXTRA_CFLAGS_POST_INCL");
-        for dep in deps.iter() {
-            println!("cargo:rerun-if-changed={}", dep);
-        }
+        self.bindgen_bpf_intf()?;
+        self.gen_bpf_skel(&mut deps)?;
+        self.gen_cargo_reruns(Some(&deps))?;
         Ok(())
     }
 }

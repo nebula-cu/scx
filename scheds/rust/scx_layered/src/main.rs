@@ -7,6 +7,7 @@ mod stats;
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::ffi::CString;
 use std::fs;
 use std::io::Write;
@@ -24,156 +25,203 @@ use anyhow::anyhow;
 use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
-use bitvec::prelude::*;
 pub use bpf_skel::*;
 use clap::Parser;
 use crossbeam::channel::RecvTimeoutError;
+use lazy_static::lazy_static;
 use libbpf_rs::skel::OpenSkel;
 use libbpf_rs::skel::Skel;
 use libbpf_rs::skel::SkelBuilder;
 use libbpf_rs::MapCore as _;
+use libbpf_rs::MapHandle;
 use libbpf_rs::OpenObject;
+use libbpf_rs::ProgramInput;
 use log::debug;
 use log::info;
 use log::trace;
 use log::warn;
+use nvml_wrapper::Nvml;
 use scx_layered::*;
 use scx_stats::prelude::*;
 use scx_utils::compat;
+use scx_utils::import_enums;
 use scx_utils::init_libbpf_logging;
-use scx_utils::ravg::ravg_read;
+use scx_utils::read_netdevs;
+use scx_utils::scx_enums;
 use scx_utils::scx_ops_attach;
 use scx_utils::scx_ops_load;
 use scx_utils::scx_ops_open;
 use scx_utils::uei_exited;
 use scx_utils::uei_report;
-use scx_utils::Cache;
 use scx_utils::CoreType;
-use scx_utils::LoadAggregator;
+use scx_utils::Cpumask;
+use scx_utils::Llc;
+use scx_utils::NetDev;
 use scx_utils::Topology;
 use scx_utils::UserExitInfo;
+use scx_utils::NR_CPUS_POSSIBLE;
+use scx_utils::NR_CPU_IDS;
 use stats::LayerStats;
 use stats::StatsReq;
 use stats::StatsRes;
 use stats::SysStats;
+use sysinfo::System;
 
-const RAVG_FRAC_BITS: u32 = bpf_intf::ravg_consts_RAVG_FRAC_BITS;
 const MAX_PATH: usize = bpf_intf::consts_MAX_PATH as usize;
 const MAX_COMM: usize = bpf_intf::consts_MAX_COMM as usize;
 const MAX_LAYER_WEIGHT: u32 = bpf_intf::consts_MAX_LAYER_WEIGHT;
 const MIN_LAYER_WEIGHT: u32 = bpf_intf::consts_MIN_LAYER_WEIGHT;
-const DEFAULT_LAYER_WEIGHT: u32 = bpf_intf::consts_DEFAULT_LAYER_WEIGHT;
 const MAX_LAYER_MATCH_ORS: usize = bpf_intf::consts_MAX_LAYER_MATCH_ORS as usize;
+const MAX_LAYER_NAME: usize = bpf_intf::consts_MAX_LAYER_NAME as usize;
 const MAX_LAYERS: usize = bpf_intf::consts_MAX_LAYERS as usize;
+const DEFAULT_LAYER_WEIGHT: u32 = bpf_intf::consts_DEFAULT_LAYER_WEIGHT;
 const USAGE_HALF_LIFE: u32 = bpf_intf::consts_USAGE_HALF_LIFE;
 const USAGE_HALF_LIFE_F64: f64 = USAGE_HALF_LIFE as f64 / 1_000_000_000.0;
-const NR_GSTATS: usize = bpf_intf::global_stat_idx_NR_GSTATS as usize;
-const NR_LSTATS: usize = bpf_intf::layer_stat_idx_NR_LSTATS as usize;
+
+const LAYER_USAGE_OWNED: usize = bpf_intf::layer_usage_LAYER_USAGE_OWNED as usize;
+const LAYER_USAGE_OPEN: usize = bpf_intf::layer_usage_LAYER_USAGE_OPEN as usize;
+const LAYER_USAGE_SUM_UPTO: usize = bpf_intf::layer_usage_LAYER_USAGE_SUM_UPTO as usize;
+const LAYER_USAGE_PROTECTED: usize = bpf_intf::layer_usage_LAYER_USAGE_PROTECTED as usize;
+const LAYER_USAGE_PROTECTED_PREEMPT: usize =
+    bpf_intf::layer_usage_LAYER_USAGE_PROTECTED_PREEMPT as usize;
+const NR_LAYER_USAGES: usize = bpf_intf::layer_usage_NR_LAYER_USAGES as usize;
+
+const NR_GSTATS: usize = bpf_intf::global_stat_id_NR_GSTATS as usize;
+const NR_LSTATS: usize = bpf_intf::layer_stat_id_NR_LSTATS as usize;
+const NR_LLC_LSTATS: usize = bpf_intf::llc_layer_stat_id_NR_LLC_LSTATS as usize;
+
 const NR_LAYER_MATCH_KINDS: usize = bpf_intf::layer_match_kind_NR_LAYER_MATCH_KINDS as usize;
 
-#[rustfmt::skip]
-lazy_static::lazy_static! {
-    static ref NR_POSSIBLE_CPUS: usize = libbpf_rs::num_possible_cpus().unwrap();
+lazy_static! {
     static ref USAGE_DECAY: f64 = 0.5f64.powf(1.0 / USAGE_HALF_LIFE_F64);
-    static ref EXAMPLE_CONFIG: LayerConfig =
-	LayerConfig {
-            specs: vec![
-		LayerSpec {
-                    name: "batch".into(),
-                    comment: Some("tasks under system.slice or tasks with nice value > 0".into()),
-                    matches: vec![
-			vec![LayerMatch::CgroupPrefix("system.slice/".into())],
-			vec![LayerMatch::NiceAbove(0)],
-                    ],
-                    kind: LayerKind::Confined {
-			cpus_range: Some((0, 16)),
-			util_range: (0.8, 0.9),
-			min_exec_us: 1000,
-			yield_ignore: 0.0,
-			preempt: false,
-			preempt_first: false,
-			exclusive: false,
-			idle_smt: false,
+    static ref DFL_DISALLOW_OPEN_AFTER_US: u64 = 2 * scx_enums.SCX_SLICE_DFL / 1000;
+    static ref DFL_DISALLOW_PREEMPT_AFTER_US: u64 = 4 * scx_enums.SCX_SLICE_DFL / 1000;
+    static ref EXAMPLE_CONFIG: LayerConfig = LayerConfig {
+        specs: vec![
+            LayerSpec {
+                name: "batch".into(),
+                comment: Some("tasks under system.slice or tasks with nice value > 0".into()),
+                matches: vec![
+                    vec![LayerMatch::CgroupPrefix("system.slice/".into())],
+                    vec![LayerMatch::NiceAbove(0)],
+                ],
+                kind: LayerKind::Confined {
+                    util_range: (0.8, 0.9),
+                    cpus_range: Some((0, 16)),
+                    common: LayerCommon {
+                        min_exec_us: 1000,
+                        yield_ignore: 0.0,
+                        preempt: false,
+                        preempt_first: false,
+                        exclusive: false,
+                        allow_node_aligned: false,
+                        idle_smt: None,
                         slice_us: 20000,
+                        fifo: false,
                         weight: DEFAULT_LAYER_WEIGHT,
+                        disallow_open_after_us: None,
+                        disallow_preempt_after_us: None,
+                        xllc_mig_min_us: 1000.0,
                         growth_algo: LayerGrowthAlgo::Sticky,
-			perf: 1024,
-			nodes: vec![],
-			llcs: vec![],
+                        perf: 1024,
+                        nodes: vec![],
+                        llcs: vec![],
                     },
-		},
-		LayerSpec {
-                    name: "immediate".into(),
-                    comment: Some("tasks under workload.slice with nice value < 0".into()),
-                    matches: vec![vec![
-			LayerMatch::CgroupPrefix("workload.slice/".into()),
-			LayerMatch::NiceBelow(0),
-                    ]],
-                    kind: LayerKind::Open {
-			min_exec_us: 100,
-			yield_ignore: 0.25,
-			preempt: true,
-			preempt_first: false,
-			exclusive: true,
-			idle_smt: false,
+                },
+            },
+            LayerSpec {
+                name: "immediate".into(),
+                comment: Some("tasks under workload.slice with nice value < 0".into()),
+                matches: vec![vec![
+                    LayerMatch::CgroupPrefix("workload.slice/".into()),
+                    LayerMatch::NiceBelow(0),
+                ]],
+                kind: LayerKind::Open {
+                    common: LayerCommon {
+                        min_exec_us: 100,
+                        yield_ignore: 0.25,
+                        preempt: true,
+                        preempt_first: false,
+                        exclusive: true,
+                        allow_node_aligned: true,
+                        idle_smt: None,
                         slice_us: 20000,
+                        fifo: false,
                         weight: DEFAULT_LAYER_WEIGHT,
+                        disallow_open_after_us: None,
+                        disallow_preempt_after_us: None,
+                        xllc_mig_min_us: 0.0,
                         growth_algo: LayerGrowthAlgo::Sticky,
-			perf: 1024,
-			nodes: vec![],
-			llcs: vec![],
+                        perf: 1024,
+                        nodes: vec![],
+                        llcs: vec![],
                     },
-		},
-		LayerSpec {
-                    name: "stress-ng".into(),
-                    comment: Some("stress-ng test layer".into()),
-                    matches: vec![vec![
-			LayerMatch::CommPrefix("stress-ng".into()),
-                    ],
-                    vec![
-			LayerMatch::PcommPrefix("stress-ng".into()),
-                    ]],
-                    kind: LayerKind::Confined {
-			cpus_range: None,
-			min_exec_us: 800,
-			yield_ignore: 0.0,
-			util_range: (0.2, 0.8),
-			preempt: true,
-			preempt_first: false,
-			exclusive: false,
-			idle_smt: false,
+                },
+            },
+            LayerSpec {
+                name: "stress-ng".into(),
+                comment: Some("stress-ng test layer".into()),
+                matches: vec![
+                    vec![LayerMatch::CommPrefix("stress-ng".into()),],
+                    vec![LayerMatch::PcommPrefix("stress-ng".into()),]
+                ],
+                kind: LayerKind::Confined {
+                    cpus_range: None,
+                    util_range: (0.2, 0.8),
+                    common: LayerCommon {
+                        min_exec_us: 800,
+                        yield_ignore: 0.0,
+                        preempt: true,
+                        preempt_first: false,
+                        exclusive: false,
+                        allow_node_aligned: false,
+                        idle_smt: None,
                         slice_us: 800,
+                        fifo: false,
                         weight: DEFAULT_LAYER_WEIGHT,
+                        disallow_open_after_us: None,
+                        disallow_preempt_after_us: None,
+                        xllc_mig_min_us: 0.0,
                         growth_algo: LayerGrowthAlgo::Topo,
-			perf: 1024,
-			nodes: vec![],
-			llcs: vec![],
+                        perf: 1024,
+                        nodes: vec![],
+                        llcs: vec![],
                     },
-		},
-		LayerSpec {
-                    name: "normal".into(),
-                    comment: Some("the rest".into()),
-                    matches: vec![vec![]],
-                    kind: LayerKind::Grouped {
-			cpus_range: None,
-			util_range: (0.5, 0.6),
-			min_exec_us: 200,
-			yield_ignore: 0.0,
-			preempt: false,
-			preempt_first: false,
-			exclusive: false,
-			idle_smt: false,
+                },
+            },
+            LayerSpec {
+                name: "normal".into(),
+                comment: Some("the rest".into()),
+                matches: vec![vec![]],
+                kind: LayerKind::Grouped {
+                    cpus_range: None,
+                    util_range: (0.5, 0.6),
+                    common: LayerCommon {
+                        min_exec_us: 200,
+                        yield_ignore: 0.0,
+                        preempt: false,
+                        preempt_first: false,
+                        exclusive: false,
+                        allow_node_aligned: false,
+                        idle_smt: None,
                         slice_us: 20000,
+                        fifo: false,
                         weight: DEFAULT_LAYER_WEIGHT,
+                        disallow_open_after_us: None,
+                        disallow_preempt_after_us: None,
+                        xllc_mig_min_us: 100.0,
                         growth_algo: LayerGrowthAlgo::Linear,
-			perf: 1024,
-			nodes: vec![],
-			llcs: vec![],
+                        perf: 1024,
+                        nodes: vec![],
+                        llcs: vec![],
                     },
-		},
-            ],
-	};
+                },
+            },
+        ],
+    };
 }
+
+static NVML_CELL: once_cell::sync::OnceCell<Nvml> = once_cell::sync::OnceCell::new();
 
 /// scx_layered: A highly configurable multi-layer sched_ext scheduler
 ///
@@ -242,6 +290,23 @@ lazy_static::lazy_static! {
 ///
 /// - TGIDEquals: Matches if the task's tgid matches the value.
 ///
+/// - NSPIDEquals: Matches if the task's namespace id and pid matches the values.
+///
+/// - NSEquals: Matches if the task's namespace id matches the values.
+///
+/// - IsGroupLeader: Bool. When true, matches if the task is group leader
+///   (i.e. PID == TGID), aka the thread from which other threads are made.
+///   When false, matches if the task is *not* the group leader (i.e. the rest).
+///
+/// - CmdJoin: Matches when the task uses pthread_setname_np to send a join/leave
+/// command to the scheduler. See examples/cmdjoin.c for more details.
+///
+/// - UsingGpu: Bool. When true, matches if the task is using a gpu
+///   as of the last time NVML was polled. When false, inverted.
+///
+/// - UsedGpu: Bool. When true, matches if the task has ever used a gpu
+///   as of the last time NVML was polled. When false, inverted.
+///
 /// While there are complexity limitations as the matches are performed in
 /// BPF, it is straightforward to add more types of matches.
 ///
@@ -298,6 +363,11 @@ lazy_static::lazy_static! {
 ///   other logical CPUs sharing the same core will be kept idle. This isn't
 ///   a hard guarantee, so don't depend on it for security purposes.
 ///
+/// - allow_node_aligned: Put node aligned tasks on layer DSQs instead of lo
+///   fallback. This is a hack to support node-affine tasks without making
+///   the whole scheduler node aware and should only be used with open
+///   layers on non-saturated machines to avoid possible stalls.
+///
 /// - slice_us: Scheduling slice duration in microseconds.
 ///
 /// - weight: Weight of the layer, which is a range from 1 to 10000 with a
@@ -306,8 +376,7 @@ lazy_static::lazy_static! {
 ///   utilization to determine the infeasible adjusted weight with higher
 ///   weights having a larger adjustment in adjusted utilization.
 ///
-/// - idle_smt: When selecting an idle CPU for task task migration use
-///   only idle SMT CPUs. The default is to select any idle cpu.
+/// - idle_smt: *** DEPRECATED ****
 ///
 /// - growth_algo: When a layer is allocated new CPUs different algorithms can
 ///   be used to determine which CPU should be allocated next. The default
@@ -424,17 +493,23 @@ struct Opts {
     #[clap(long)]
     xnuma_preemption: bool,
 
+    /// Disable monitor
+    #[clap(long)]
+    monitor_disable: bool,
+
     /// Write example layer specifications into the file and exit.
     #[clap(short = 'e', long)]
     example: Option<String>,
 
-    /// Disables preemption if the weighted load fraction of a layer (load_frac_adj) exceeds the
-    /// threshold. The default is disabled (0.0).
+    /// ***DEPRECATED*** Disables preemption if the weighted load fraction
+    /// of a layer (load_frac_adj) exceeds the threshold. The default is
+    /// disabled (0.0).
     #[clap(long, default_value = "0.0")]
     layer_preempt_weight_disable: f64,
 
-    /// Disables layer growth if the weighted load fraction of a layer (load_frac_adj) exceeds the
-    /// threshold. The default is disabled (0.0).
+    /// ***DEPRECATED*** Disables layer growth if the weighted load fraction
+    /// of a layer (load_frac_adj) exceeds the threshold. The default is
+    /// disabled (0.0).
     #[clap(long, default_value = "0.0")]
     layer_growth_weight_disable: f64,
 
@@ -450,6 +525,56 @@ struct Opts {
     /// Run with example layer specifications (useful for e.g. CI pipelines)
     #[clap(long)]
     run_example: bool,
+
+    /// ***DEPRECATED *** Enables iteration over local LLCs first for
+    /// dispatch.
+    #[clap(long, default_value = "false")]
+    local_llc_iteration: bool,
+
+    /// Low priority fallback DSQs are used to execute tasks with custom CPU
+    /// affinities. These DSQs are immediately executed iff a CPU is
+    /// otherwise idle. However, after the specified wait, they are
+    /// guranteed upto --lo-fb-share fraction of each CPU.
+    #[clap(long, default_value = "10000")]
+    lo_fb_wait_us: u64,
+
+    /// The fraction of CPU time guaranteed to low priority fallback DSQs.
+    /// See --lo-fb-wait-us.
+    #[clap(long, default_value = ".05")]
+    lo_fb_share: f64,
+
+    /// Disable antistall
+    #[clap(long, default_value = "false")]
+    disable_antistall: bool,
+
+    /// Maximum task runnable_at delay (in seconds) before antistall turns on
+    #[clap(long, default_value = "3")]
+    antistall_sec: u64,
+
+    /// Enable gpu support
+    #[clap(long, default_value = "false")]
+    enable_gpu_support: bool,
+
+    /// GPU Pid Poll Short Interval, if gpu support enabled.
+    #[clap(long, default_value = "180")]
+    gpu_poll_short_interval: u64,
+
+    /// On each user space update loop, use NVML to update GPU pids.
+    /// The alternative (and default) is to use loose heuristics
+    /// (i.e. start_time/existence of prior gpu process) to
+    /// reduce NVML calls (at the expense of scheduling accuracy).
+    /// This is to reduce the odds of taking systems offline due to NVML
+    /// triggering crashes when concurrently called.
+    #[clap(long, default_value = "false")]
+    aggressive_nvml_polling: bool,
+
+    /// Enable netdev IRQ balancing. This is experimental and should be used with caution.
+    #[clap(long, default_value = "false")]
+    netdev_irq_balance: bool,
+
+    /// Disable queued wakeup optimization.
+    #[clap(long, default_value = "false")]
+    disable_queued_wakeup: bool,
 
     /// Show descriptions for statistics.
     #[clap(long)]
@@ -539,10 +664,10 @@ fn nodemask_from_nodes(nodes: &Vec<usize>) -> usize {
     mask
 }
 
-fn cachemask_from_llcs(llcs: &BTreeMap<usize, Cache>) -> usize {
+fn llcmask_from_llcs(llcs: &BTreeMap<usize, Arc<Llc>>) -> usize {
     let mut mask = 0;
     for (_, cache) in llcs {
-        mask |= 1 << cache.id();
+        mask |= 1 << cache.id;
     }
     mask
 }
@@ -555,7 +680,7 @@ fn read_cpu_ctxs(skel: &BpfSkel) -> Result<Vec<bpf_intf::cpu_ctx>> {
         .lookup_percpu(&0u32.to_ne_bytes(), libbpf_rs::MapFlags::ANY)
         .context("Failed to lookup cpu_ctx")?
         .unwrap();
-    for cpu in 0..*NR_POSSIBLE_CPUS {
+    for cpu in 0..*NR_CPUS_POSSIBLE {
         cpu_ctxs.push(*unsafe {
             &*(cpu_ctxs_vec[cpu].as_slice().as_ptr() as *const bpf_intf::cpu_ctx)
         });
@@ -563,62 +688,23 @@ fn read_cpu_ctxs(skel: &BpfSkel) -> Result<Vec<bpf_intf::cpu_ctx>> {
     Ok(cpu_ctxs)
 }
 
-fn convert_cpu_ctxs(cpu_ctxs: Vec<bpf_intf::cpu_ctx>) -> Vec<Vec<u8>> {
-    cpu_ctxs
-        .into_iter()
-        .map(|cpu_ctx| {
-            let bytes = unsafe {
-                std::slice::from_raw_parts(
-                    &cpu_ctx as *const bpf_intf::cpu_ctx as *const u8,
-                    std::mem::size_of::<bpf_intf::cpu_ctx>(),
-                )
-            };
-            bytes.to_vec()
-        })
-        .collect()
-}
-
-fn initialize_cpu_ctxs(skel: &BpfSkel, topo: &Topology) -> Result<()> {
-    let key = (0_u32).to_ne_bytes();
-    let mut cpu_ctxs: Vec<bpf_intf::cpu_ctx> = vec![];
-    let cpu_ctxs_vec = skel
-        .maps
-        .cpu_ctxs
-        .lookup_percpu(&key, libbpf_rs::MapFlags::ANY)
-        .context("Failed to lookup cpu_ctx")?
-        .unwrap();
-
-    for cpu in 0..*NR_POSSIBLE_CPUS {
-        cpu_ctxs.push(*unsafe {
-            &*(cpu_ctxs_vec[cpu].as_slice().as_ptr() as *const bpf_intf::cpu_ctx)
-        });
-
-        let topo_cpu = topo.cpus().get(&cpu).unwrap();
-        let is_big = topo_cpu.core_type == CoreType::Big { turbo: true };
-        cpu_ctxs[cpu].is_big = is_big;
-    }
-
-    skel.maps
-        .cpu_ctxs
-        .update_percpu(&key, &convert_cpu_ctxs(cpu_ctxs), libbpf_rs::MapFlags::ANY)
-        .context("Failed to update cpu_ctx")?;
-
-    Ok(())
-}
-
 #[derive(Clone, Debug)]
 struct BpfStats {
     gstats: Vec<u64>,
     lstats: Vec<Vec<u64>>,
     lstats_sums: Vec<u64>,
+    llc_lstats: Vec<Vec<Vec<u64>>>, // [layer][llc][stat]
 }
 
 impl BpfStats {
-    fn read(cpu_ctxs: &[bpf_intf::cpu_ctx], nr_layers: usize) -> Self {
+    fn read(skel: &BpfSkel, cpu_ctxs: &[bpf_intf::cpu_ctx]) -> Self {
+        let nr_layers = skel.maps.rodata_data.nr_layers as usize;
+        let nr_llcs = skel.maps.rodata_data.nr_llcs as usize;
         let mut gstats = vec![0u64; NR_GSTATS];
         let mut lstats = vec![vec![0u64; NR_LSTATS]; nr_layers];
+        let mut llc_lstats = vec![vec![vec![0u64; NR_LLC_LSTATS]; nr_llcs]; nr_layers];
 
-        for cpu in 0..*NR_POSSIBLE_CPUS {
+        for cpu in 0..*NR_CPUS_POSSIBLE {
             for stat in 0..NR_GSTATS {
                 gstats[stat] += cpu_ctxs[cpu].gstats[stat];
             }
@@ -636,10 +722,35 @@ impl BpfStats {
             }
         }
 
+        for llc_id in 0..nr_llcs {
+            // XXX - This would be a lot easier if llc_ctx were in
+            // the bss. Unfortunately, kernel < v6.12 crashes and
+            // kernel >= v6.12 fails verification after such
+            // conversion due to seemingly verifier bugs. Convert to
+            // bss maps later.
+            let key = llc_id as u32;
+            let llc_id_slice =
+                unsafe { std::slice::from_raw_parts((&key as *const u32) as *const u8, 4) };
+            let v = skel
+                .maps
+                .llc_data
+                .lookup(llc_id_slice, libbpf_rs::MapFlags::ANY)
+                .unwrap()
+                .unwrap();
+            let llcc = unsafe { *(v.as_slice().as_ptr() as *const bpf_intf::llc_ctx) };
+
+            for layer_id in 0..nr_layers {
+                for stat_id in 0..NR_LLC_LSTATS {
+                    llc_lstats[layer_id][llc_id][stat_id] = llcc.lstats[layer_id][stat_id];
+                }
+            }
+        }
+
         Self {
             gstats,
             lstats,
             lstats_sums,
+            llc_lstats,
         }
     }
 }
@@ -658,30 +769,45 @@ impl<'a, 'b> Sub<&'b BpfStats> for &'a BpfStats {
                 .map(|(l, r)| vec_sub(l, r))
                 .collect(),
             lstats_sums: vec_sub(&self.lstats_sums, &rhs.lstats_sums),
+            llc_lstats: self
+                .llc_lstats
+                .iter()
+                .zip(rhs.llc_lstats.iter())
+                .map(|(l_layer, r_layer)| {
+                    l_layer
+                        .iter()
+                        .zip(r_layer.iter())
+                        .map(|(l_llc, r_llc)| {
+                            let (l_llc, mut r_llc) = (l_llc.clone(), r_llc.clone());
+                            // Lat is not subtractable, take L side.
+                            r_llc[bpf_intf::llc_layer_stat_id_LLC_LSTAT_LAT as usize] = 0;
+                            vec_sub(&l_llc, &r_llc)
+                        })
+                        .collect()
+                })
+                .collect(),
         }
     }
 }
 
+#[derive(Debug)]
+struct GpuMonData {
+    sysinfo_sys: sysinfo::System,
+    last_nvml_poll: std::time::SystemTime,
+    gpu_pidmap: HashMap<u32, u64>,
+}
+
 #[derive(Clone, Debug)]
 struct Stats {
-    nr_layers: usize,
     at: Instant,
-
+    elapsed: Duration,
+    nr_layers: usize,
     nr_layer_tasks: Vec<usize>,
-
     nr_nodes: usize,
-    total_load: f64,
-    layer_loads: Vec<f64>,
-
-    // infeasible stats
-    layer_load_sums: Vec<f64>,
-    total_load_sum: f64,
-    layer_dcycle_sums: Vec<f64>,
-    total_dcycle_sum: f64,
 
     total_util: f64, // Running AVG of sum of layer_utils
-    layer_utils: Vec<f64>,
-    prev_layer_cycles: Vec<u64>,
+    layer_utils: Vec<Vec<f64>>,
+    prev_layer_usages: Vec<Vec<u64>>,
 
     cpu_busy: f64, // Read from /proc, maybe higher than total_util
     prev_total_cpu: procfs::CpuStat,
@@ -696,69 +822,64 @@ struct Stats {
 }
 
 impl Stats {
-    fn read_layer_loads(skel: &mut BpfSkel, nr_layers: usize) -> (f64, Vec<f64>) {
-        let now_mono = now_monotonic();
-        let layer_loads: Vec<f64> = skel
-            .maps
-            .bss_data
-            .layers
-            .iter()
-            .take(nr_layers)
-            .map(|layer| {
-                let rd = &layer.load_rd;
-                ravg_read(
-                    rd.val,
-                    rd.val_at,
-                    rd.old,
-                    rd.cur,
-                    now_mono,
-                    USAGE_HALF_LIFE,
-                    RAVG_FRAC_BITS,
-                )
-            })
-            .collect();
-        (layer_loads.iter().sum(), layer_loads)
-    }
+    fn read_layer_usages(cpu_ctxs: &[bpf_intf::cpu_ctx], nr_layers: usize) -> Vec<Vec<u64>> {
+        let now = now_monotonic();
+        let mut layer_usages = vec![vec![0u64; NR_LAYER_USAGES]; nr_layers];
 
-    fn read_layer_cycles(cpu_ctxs: &[bpf_intf::cpu_ctx], nr_layers: usize) -> Vec<u64> {
-        let mut layer_cycles = vec![0u64; nr_layers];
-
-        for cpu in 0..*NR_POSSIBLE_CPUS {
+        for cpu in 0..*NR_CPUS_POSSIBLE {
             for layer in 0..nr_layers {
-                layer_cycles[layer] += cpu_ctxs[cpu].layer_cycles[layer];
+                for usage in 0..NR_LAYER_USAGES {
+                    layer_usages[layer][usage] += cpu_ctxs[cpu].layer_usages[layer][usage];
+                }
             }
         }
 
-        layer_cycles
+        // layer_usages are updated at ops.stopping(). If tasks in a layer
+        // keep running, it may not update the usage stats for a long time
+        // to the point where the reported usage stats fluctuate wildly
+        // making CPU allocation oscillate. Compensate for it by adding the
+        // time spent for the currently running task.
+        //
+        // This is racy but the error range is bound. Implement seq_lock
+        // equivalent to make this fully correct. Due to the raciness, it
+        // may be possible for usage stats to go backward. Use saturating
+        // sub when calculating delta. See cur_layer_utils calculation in
+        // Stats::refresh().
+        for cpuc in cpu_ctxs {
+            let layer = cpuc.task_layer_id as usize;
+            if layer < MAX_LAYERS {
+                let usage = match cpuc.running_owned {
+                    true => LAYER_USAGE_OWNED,
+                    false => LAYER_USAGE_OPEN,
+                };
+                if now > cpuc.running_at {
+                    layer_usages[layer][usage] += now - cpuc.running_at;
+                }
+            }
+        }
+
+        layer_usages
     }
 
     fn new(skel: &mut BpfSkel, proc_reader: &procfs::ProcReader) -> Result<Self> {
         let nr_layers = skel.maps.rodata_data.nr_layers as usize;
         let cpu_ctxs = read_cpu_ctxs(skel)?;
-        let bpf_stats = BpfStats::read(&cpu_ctxs, nr_layers);
+        let bpf_stats = BpfStats::read(skel, &cpu_ctxs);
         let nr_nodes = skel.maps.rodata_data.nr_nodes as usize;
 
         Ok(Self {
             at: Instant::now(),
+            elapsed: Default::default(),
             nr_layers,
-
             nr_layer_tasks: vec![0; nr_layers],
-
             nr_nodes,
-            total_load: 0.0,
-            layer_loads: vec![0.0; nr_layers],
-
-            layer_load_sums: vec![0.0, nr_layers as f64],
-            total_load_sum: 0.0,
-            layer_dcycle_sums: vec![0.0, nr_layers as f64],
-            total_dcycle_sum: 0.0,
 
             total_util: 0.0,
-            layer_utils: vec![0.0; nr_layers],
-            prev_layer_cycles: Self::read_layer_cycles(&cpu_ctxs, nr_layers),
+            layer_utils: vec![vec![0.0; NR_LAYER_USAGES]; nr_layers],
+            prev_layer_usages: Self::read_layer_usages(&cpu_ctxs, nr_layers),
 
             cpu_busy: 0.0,
-            prev_total_cpu: read_total_cpu(&proc_reader)?,
+            prev_total_cpu: read_total_cpu(proc_reader)?,
 
             bpf_stats: bpf_stats.clone(),
             prev_bpf_stats: bpf_stats,
@@ -774,11 +895,11 @@ impl Stats {
         &mut self,
         skel: &mut BpfSkel,
         proc_reader: &procfs::ProcReader,
-        load_agg: &mut LoadAggregator,
         now: Instant,
         cur_processing_dur: Duration,
     ) -> Result<()> {
-        let elapsed = now.duration_since(self.at).as_secs_f64() as f64;
+        let elapsed = now.duration_since(self.at);
+        let elapsed_f64 = elapsed.as_secs_f64();
         let cpu_ctxs = read_cpu_ctxs(skel)?;
 
         let nr_layer_tasks: Vec<usize> = skel
@@ -789,57 +910,45 @@ impl Stats {
             .take(self.nr_layers)
             .map(|layer| layer.nr_tasks as usize)
             .collect();
-        let layer_weights: Vec<usize> = skel
-            .maps
-            .bss_data
-            .layers
-            .iter()
-            .take(self.nr_layers)
-            .map(|layer| layer.weight as usize)
-            .collect();
-
         let layer_slice_us: Vec<u64> = skel
             .maps
             .bss_data
             .layers
             .iter()
             .take(self.nr_layers)
-            .map(|layer| layer.slice_ns / 1000 as u64)
+            .map(|layer| layer.slice_ns / 1000_u64)
             .collect();
 
-        let (total_load, layer_loads) = Self::read_layer_loads(skel, self.nr_layers);
-
-        let cur_layer_cycles = Self::read_layer_cycles(&cpu_ctxs, self.nr_layers);
-        cur_layer_cycles
+        let cur_layer_usages = Self::read_layer_usages(&cpu_ctxs, self.nr_layers);
+        // See read_layer_usages() on why saturating_sub is used below.
+        let cur_layer_utils: Vec<Vec<f64>> = cur_layer_usages
             .iter()
-            .zip(layer_weights)
-            .enumerate()
-            .for_each(|(layer_idx, (usage, weight))| {
-                let mut load = 0.0;
-                if self.prev_layer_cycles[layer_idx] > 0 {
-                    load = (*usage - self.prev_layer_cycles[layer_idx]) as f64;
-                }
-                let _ = load_agg.record_dom_load(layer_idx, weight, load as f64);
-            });
-        let cur_layer_utils: Vec<f64> = cur_layer_cycles
-            .iter()
-            .zip(self.prev_layer_cycles.iter())
-            .map(|(cur, prev)| (cur - prev) as f64 / 1_000_000_000.0 / elapsed)
+            .zip(self.prev_layer_usages.iter())
+            .map(|(cur, prev)| {
+                cur.iter()
+                    .zip(prev.iter())
+                    .map(|(c, p)| (c.saturating_sub(*p)) as f64 / 1_000_000_000.0 / elapsed_f64)
+                    .collect()
+            })
             .collect();
-        let layer_utils: Vec<f64> = cur_layer_utils
+        let layer_utils: Vec<Vec<f64>> = cur_layer_utils
             .iter()
             .zip(self.layer_utils.iter())
             .map(|(cur, prev)| {
-                let decay = USAGE_DECAY.powf(elapsed);
-                prev * decay + cur * (1.0 - decay)
+                cur.iter()
+                    .zip(prev.iter())
+                    .map(|(c, p)| {
+                        let decay = USAGE_DECAY.powf(elapsed_f64);
+                        p * decay + c * (1.0 - decay)
+                    })
+                    .collect()
             })
             .collect();
 
-        let load_ledger = load_agg.calculate();
         let cur_total_cpu = read_total_cpu(proc_reader)?;
         let cpu_busy = calc_util(&cur_total_cpu, &self.prev_total_cpu)?;
 
-        let cur_bpf_stats = BpfStats::read(&cpu_ctxs, self.nr_layers);
+        let cur_bpf_stats = BpfStats::read(skel, &cpu_ctxs);
         let bpf_stats = &cur_bpf_stats - &self.prev_bpf_stats;
 
         let processing_dur = cur_processing_dur
@@ -848,22 +957,14 @@ impl Stats {
 
         *self = Self {
             at: now,
+            elapsed,
             nr_layers: self.nr_layers,
-
             nr_layer_tasks,
-
             nr_nodes: self.nr_nodes,
-            total_load,
-            layer_loads,
 
-            total_load_sum: load_ledger.global_load_sum(),
-            layer_load_sums: load_ledger.dom_load_sums().to_vec(),
-            total_dcycle_sum: load_ledger.global_dcycle_sum(),
-            layer_dcycle_sums: load_ledger.dom_dcycle_sums().to_vec(),
-
-            total_util: layer_utils.iter().sum(),
-            layer_utils: layer_utils.try_into().unwrap(),
-            prev_layer_cycles: cur_layer_cycles,
+            total_util: layer_utils.iter().flatten().sum(),
+            layer_utils: layer_utils,
+            prev_layer_usages: cur_layer_usages,
 
             cpu_busy,
             prev_total_cpu: cur_total_cpu,
@@ -887,47 +988,43 @@ struct Layer {
     core_order: Vec<usize>,
 
     nr_cpus: usize,
-    preempt: bool,
-    can_preempt: bool,
-    cpus: BitVec,
-    allowed_cpus: BitVec,
+    nr_llc_cpus: Vec<usize>,
+    cpus: Cpumask,
+    allowed_cpus: Cpumask,
 }
 
 impl Layer {
-    fn new(spec: &LayerSpec, idx: usize, cpu_pool: &CpuPool, topo: &Topology) -> Result<Self> {
+    fn new(spec: &LayerSpec, topo: &Topology, core_order: &Vec<usize>) -> Result<Self> {
         let name = &spec.name;
         let kind = spec.kind.clone();
-        let mut cpus = bitvec![0; cpu_pool.nr_cpus];
-        cpus.fill(false);
-        let mut allowed_cpus = bitvec![0; cpu_pool.nr_cpus];
+        let mut allowed_cpus = Cpumask::new();
         match &kind {
             LayerKind::Confined {
                 cpus_range,
                 util_range,
-                nodes,
-                llcs,
+                common: LayerCommon { nodes, llcs, .. },
                 ..
             } => {
                 let cpus_range = cpus_range.unwrap_or((0, std::usize::MAX));
                 if cpus_range.0 > cpus_range.1 || cpus_range.1 == 0 {
                     bail!("invalid cpus_range {:?}", cpus_range);
                 }
-                if nodes.len() == 0 && llcs.len() == 0 {
-                    allowed_cpus.fill(true);
+                if nodes.is_empty() && llcs.is_empty() {
+                    allowed_cpus.set_all();
                 } else {
                     // build up the cpus bitset
-                    for node in topo.nodes() {
+                    for (node_id, node) in &topo.nodes {
                         // first do the matching for nodes
-                        if nodes.contains(&(node.id() as usize)) {
-                            for (id, _cpu) in node.cpus() {
-                                allowed_cpus.set(id, true);
+                        if nodes.contains(node_id) {
+                            for &id in node.all_cpus.keys() {
+                                allowed_cpus.set_cpu(id)?;
                             }
                         }
                         // next match on any LLCs
-                        for (_, llc) in node.llcs() {
-                            if llcs.contains(&(llc.id() as usize)) {
-                                for (id, _cpu) in llc.cpus() {
-                                    allowed_cpus.set(id, true);
+                        for (llc_id, llc) in &node.llcs {
+                            if llcs.contains(llc_id) {
+                                for &id in llc.all_cpus.keys() {
+                                    allowed_cpus.set_cpu(id)?;
                                 }
                             }
                         }
@@ -943,23 +1040,30 @@ impl Layer {
                     bail!("invalid util_range {:?}", util_range);
                 }
             }
-            LayerKind::Grouped { nodes, llcs, .. } | LayerKind::Open { nodes, llcs, .. } => {
-                if nodes.len() == 0 && llcs.len() == 0 {
-                    allowed_cpus.fill(true);
+            LayerKind::Grouped {
+                common: LayerCommon { nodes, llcs, .. },
+                ..
+            }
+            | LayerKind::Open {
+                common: LayerCommon { nodes, llcs, .. },
+                ..
+            } => {
+                if nodes.is_empty() && llcs.is_empty() {
+                    allowed_cpus.set_all();
                 } else {
                     // build up the cpus bitset
-                    for node in topo.nodes() {
+                    for (node_id, node) in &topo.nodes {
                         // first do the matching for nodes
-                        if nodes.contains(&(node.id() as usize)) {
-                            for (id, _cpu) in node.cpus() {
-                                allowed_cpus.set(id, true);
+                        if nodes.contains(node_id) {
+                            for &id in node.all_cpus.keys() {
+                                allowed_cpus.set_cpu(id)?;
                             }
                         }
                         // next match on any LLCs
-                        for (_, llc) in node.llcs() {
-                            if llcs.contains(&(llc.id() as usize)) {
-                                for (id, _cpu) in llc.cpus() {
-                                    allowed_cpus.set(id, true);
+                        for (llc_id, llc) in &node.llcs {
+                            if llcs.contains(llc_id) {
+                                for &id in llc.all_cpus.keys() {
+                                    allowed_cpus.set_cpu(id)?;
                                 }
                             }
                         }
@@ -968,70 +1072,48 @@ impl Layer {
             }
         }
 
-        let layer_growth_algo = match &kind {
-            LayerKind::Confined { growth_algo, .. }
-            | LayerKind::Grouped { growth_algo, .. }
-            | LayerKind::Open { growth_algo, .. } => growth_algo.clone(),
-        };
-        let preempt = match &kind {
-            LayerKind::Confined { preempt, .. }
-            | LayerKind::Grouped { preempt, .. }
-            | LayerKind::Open { preempt, .. } => preempt.clone(),
-        };
+        let layer_growth_algo = kind.common().growth_algo.clone();
 
-        let core_order = layer_growth_algo.layer_core_order(cpu_pool, spec, idx, topo);
         debug!(
             "layer: {} algo: {:?} core order: {:?}",
-            name,
-            layer_growth_algo.clone(),
-            core_order
+            name, &layer_growth_algo, core_order
         );
 
         Ok(Self {
             name: name.into(),
             kind,
-            core_order,
+            core_order: core_order.clone(),
 
             nr_cpus: 0,
-            preempt,
-            can_preempt: preempt,
-            cpus,
+            nr_llc_cpus: vec![0; topo.all_llcs.len()],
+            cpus: Cpumask::new(),
             allowed_cpus,
         })
     }
 
-    fn grow_confined_or_grouped(
-        &mut self,
-        cpu_pool: &mut CpuPool,
-        (cpus_min, cpus_max): (usize, usize),
-        (_util_low, util_high): (f64, f64),
-        layer_growth_weight_disable: f64,
-        (layer_load, total_load): (f64, f64),
-        (layer_util, _total_util): (f64, f64),
-    ) -> Result<bool> {
-        let nr_cpus = self.cpus.count_ones();
-        if nr_cpus >= cpus_max {
-            trace!("layer {} has {} max: {}", &self.name, nr_cpus, cpus_max);
-            return Ok(false);
-        }
+    fn free_some_cpus(&mut self, cpu_pool: &mut CpuPool, max_to_free: usize) -> Result<usize> {
+        let cpus_to_free = match cpu_pool.next_to_free(&self.cpus, self.core_order.iter().rev())? {
+            Some(ret) => ret.clone(),
+            None => return Ok(0),
+        };
 
-        // Do we already have enough?
-        if nr_cpus >= cpus_min
-            && (layer_util == 0.0 || (nr_cpus > 0 && layer_util / nr_cpus as f64 <= util_high))
-        {
-            return Ok(false);
-        }
-        if total_load > 0.0
-            && layer_growth_weight_disable > 0.0
-            && layer_load / total_load > layer_growth_weight_disable
-        {
-            trace!(
-                "layer-{} needs more CPUs (util={:.3}) but is over the load fraction",
-                &self.name, layer_util
-            );
-            return Ok(false);
-        }
+        let nr_to_free = cpus_to_free.weight();
 
+        Ok(if nr_to_free <= max_to_free {
+            trace!("[{}] freeing CPUs: {}", self.name, &cpus_to_free);
+            self.cpus &= &cpus_to_free.not();
+            self.nr_cpus -= nr_to_free;
+            for cpu in cpus_to_free.iter() {
+                self.nr_llc_cpus[cpu_pool.topo.all_cpus[&cpu].llc_id] -= 1;
+            }
+            cpu_pool.free(&cpus_to_free)?;
+            nr_to_free
+        } else {
+            0
+        })
+    }
+
+    fn alloc_some_cpus(&mut self, cpu_pool: &mut CpuPool) -> Result<usize> {
         let new_cpus = match cpu_pool
             .alloc_cpus(&self.allowed_cpus, &self.core_order)
             .clone()
@@ -1039,140 +1121,19 @@ impl Layer {
             Some(ret) => ret.clone(),
             None => {
                 trace!("layer-{} can't grow, no CPUs", &self.name);
-                return Ok(false);
+                return Ok(0);
             }
         };
 
-        trace!(
-            "layer-{} adding {} CPUs to {} CPUs",
-            &self.name,
-            new_cpus.count_ones(),
-            nr_cpus,
-        );
+        let nr_new_cpus = new_cpus.weight();
+
+        trace!("[{}] adding CPUs: {}", &self.name, &new_cpus);
         self.cpus |= &new_cpus;
-        self.nr_cpus = self.cpus.count_ones();
-        Ok(true)
-    }
-
-    fn cpus_to_free(
-        &self,
-        cpu_pool: &mut CpuPool,
-        (cpus_min, _cpus_max): (usize, usize),
-        (util_low, util_high): (f64, f64),
-        layer_growth_weight_disable: f64,
-        (layer_load, total_load): (f64, f64),
-        (layer_util, _total_util): (f64, f64),
-    ) -> Result<Option<BitVec>> {
-        let nr_cpus = self.cpus.count_ones();
-        if nr_cpus <= cpus_min {
-            return Ok(None);
+        self.nr_cpus += nr_new_cpus;
+        for cpu in new_cpus.iter() {
+            self.nr_llc_cpus[cpu_pool.topo.all_cpus[&cpu].llc_id] += 1;
         }
-        let cpus_to_free = match cpu_pool.next_to_free(&self.cpus)? {
-            Some(ret) => ret.clone(),
-            None => return Ok(None),
-        };
-
-        let nr_to_free = cpus_to_free.count_ones();
-
-        // If we'd be over the load fraction even after freeing
-        // $cpus_to_free, we have to free.
-        if layer_growth_weight_disable > 0.0
-            && layer_load / total_load >= layer_growth_weight_disable
-        {
-            return Ok(Some(cpus_to_free));
-        }
-
-        if layer_util / nr_cpus as f64 >= util_low {
-            return Ok(None);
-        }
-
-        // Can't shrink if losing the CPUs pushes us over @util_high.
-        match nr_cpus - nr_to_free {
-            0 => {
-                if layer_util > 0.0 {
-                    return Ok(None);
-                }
-            }
-            nr_left => {
-                if layer_util / nr_left as f64 >= util_high {
-                    return Ok(None);
-                }
-            }
-        }
-
-        return Ok(Some(cpus_to_free));
-    }
-
-    fn shrink_confined_or_grouped(
-        &mut self,
-        cpu_pool: &mut CpuPool,
-        cpus_range: (usize, usize),
-        util_range: (f64, f64),
-        layer_growth_weight_disable: f64,
-        load: (f64, f64),
-        util: (f64, f64),
-    ) -> Result<bool> {
-        match self.cpus_to_free(
-            cpu_pool,
-            cpus_range,
-            util_range,
-            layer_growth_weight_disable,
-            load,
-            util,
-        )? {
-            Some(cpus_to_free) => {
-                trace!("{} freeing CPUs\n{}", self.name, &cpus_to_free);
-                self.cpus &= !cpus_to_free.clone();
-                cpu_pool.free(&cpus_to_free)?;
-                self.nr_cpus = self.cpus.count_ones();
-                Ok(true)
-            }
-            None => Ok(false),
-        }
-    }
-
-    fn resize_confined_or_grouped(
-        &mut self,
-        cpu_pool: &mut CpuPool,
-        cpus_range: Option<(usize, usize)>,
-        util_range: (f64, f64),
-        layer_growth_weight_disable: f64,
-        load: (f64, f64),
-        util: (f64, f64),
-    ) -> Result<i64> {
-        let cpus_range = cpus_range.unwrap_or((0, std::usize::MAX));
-        let mut adjusted = 0;
-
-        while self.grow_confined_or_grouped(
-            cpu_pool,
-            cpus_range,
-            util_range,
-            layer_growth_weight_disable,
-            load,
-            util,
-        )? {
-            adjusted += 1;
-            trace!("{} grew, adjusted={}", &self.name, adjusted);
-        }
-
-        if adjusted == 0 {
-            while self.shrink_confined_or_grouped(
-                cpu_pool,
-                cpus_range,
-                util_range,
-                layer_growth_weight_disable,
-                load,
-                util,
-            )? {
-                adjusted -= 1;
-                trace!("{} shrunk, adjusted={}", &self.name, adjusted);
-            }
-        }
-
-        if adjusted != 0 {
-            trace!("{} done resizing, adjusted={}", &self.name, adjusted);
-        }
-        Ok(adjusted)
+        Ok(nr_new_cpus)
     }
 }
 
@@ -1186,25 +1147,21 @@ struct Scheduler<'a> {
     cpu_pool: CpuPool,
     layers: Vec<Layer>,
 
-    layer_preempt_weight_disable: f64,
-    layer_growth_weight_disable: f64,
-
     proc_reader: procfs::ProcReader,
     sched_stats: Stats,
 
     nr_layer_cpus_ranges: Vec<(usize, usize)>,
     processing_dur: Duration,
 
+    topo: Arc<Topology>,
+    netdevs: BTreeMap<String, NetDev>,
     stats_server: StatsServer<StatsReq, StatsRes>,
+    opts: &'a Opts,
+    gpu_mon_data: GpuMonData,
 }
 
 impl<'a> Scheduler<'a> {
-    fn init_layers(
-        skel: &mut OpenBpfSkel,
-        opts: &Opts,
-        specs: &Vec<LayerSpec>,
-        topo: &Topology,
-    ) -> Result<()> {
+    fn init_layers(skel: &mut OpenBpfSkel, specs: &[LayerSpec], topo: &Topology) -> Result<()> {
         skel.maps.rodata_data.nr_layers = specs.len() as u32;
         let mut perf_set = false;
 
@@ -1262,6 +1219,31 @@ impl<'a> Scheduler<'a> {
                             mt.kind = bpf_intf::layer_match_kind_MATCH_TGID_EQUALS as i32;
                             mt.tgid = *tgid;
                         }
+                        LayerMatch::NSPIDEquals(nsid, pid) => {
+                            mt.kind = bpf_intf::layer_match_kind_MATCH_NSPID_EQUALS as i32;
+                            mt.nsid = *nsid;
+                            mt.pid = *pid;
+                        }
+                        LayerMatch::NSEquals(nsid) => {
+                            mt.kind = bpf_intf::layer_match_kind_MATCH_NS_EQUALS as i32;
+                            mt.nsid = *nsid as u64;
+                        }
+                        LayerMatch::CmdJoin(joincmd) => {
+                            mt.kind = bpf_intf::layer_match_kind_MATCH_SCXCMD_JOIN as i32;
+                            copy_into_cstr(&mut mt.comm_prefix, joincmd);
+                        }
+                        LayerMatch::IsGroupLeader(polarity) => {
+                            mt.kind = bpf_intf::layer_match_kind_MATCH_IS_GROUP_LEADER as i32;
+                            mt.is_group_leader.write(*polarity);
+                        }
+                        LayerMatch::UsingGpu(polarity) => {
+                            mt.kind = bpf_intf::layer_match_kind_MATCH_USING_GPU as i32;
+                            mt.using_gpu.write(*polarity);
+                        }
+                        LayerMatch::UsedGpu(polarity) => {
+                            mt.kind = bpf_intf::layer_match_kind_MATCH_USED_GPU as i32;
+                            mt.used_gpu.write(*polarity);
+                        }
                     }
                 }
                 layer.matches[or_i].nr_match_ands = or.len() as i32;
@@ -1270,89 +1252,63 @@ impl<'a> Scheduler<'a> {
             layer.nr_match_ors = spec.matches.len() as u32;
             layer.kind = spec.kind.as_bpf_enum();
 
-            match &spec.kind {
-                LayerKind::Confined {
+            {
+                let LayerCommon {
                     min_exec_us,
                     yield_ignore,
                     perf,
                     preempt,
                     preempt_first,
                     exclusive,
-                    idle_smt,
+                    allow_node_aligned,
                     growth_algo,
                     nodes,
                     slice_us,
+                    fifo,
                     weight,
+                    disallow_open_after_us,
+                    disallow_preempt_after_us,
+                    xllc_mig_min_us,
                     ..
-                }
-                | LayerKind::Grouped {
-                    min_exec_us,
-                    yield_ignore,
-                    perf,
-                    preempt,
-                    preempt_first,
-                    exclusive,
-                    idle_smt,
-                    growth_algo,
-                    nodes,
-                    slice_us,
-                    weight,
-                    ..
-                }
-                | LayerKind::Open {
-                    min_exec_us,
-                    yield_ignore,
-                    perf,
-                    preempt,
-                    preempt_first,
-                    exclusive,
-                    idle_smt,
-                    growth_algo,
-                    nodes,
-                    slice_us,
-                    weight,
-                    ..
-                } => {
-                    layer.slice_ns = if *slice_us > 0 {
-                        *slice_us * 1000
-                    } else {
-                        opts.slice_us * 1000
-                    };
-                    layer.min_exec_ns = min_exec_us * 1000;
-                    layer.yield_step_ns = if *yield_ignore > 0.999 {
-                        0
-                    } else if *yield_ignore < 0.001 {
-                        layer.slice_ns
-                    } else {
-                        (layer.slice_ns as f64 * (1.0 - *yield_ignore)) as u64
-                    };
-                    layer.preempt.write(*preempt);
-                    layer.preempt_first.write(*preempt_first);
-                    layer.exclusive.write(*exclusive);
-                    layer.idle_smt.write(*idle_smt);
-                    layer.growth_algo = growth_algo.as_bpf_enum();
-                    layer.weight = if *weight <= MAX_LAYER_WEIGHT && *weight >= MIN_LAYER_WEIGHT {
-                        *weight
-                    } else {
-                        DEFAULT_LAYER_WEIGHT
-                    };
-                    layer_weights.push(layer.weight.try_into().unwrap());
-                    layer.perf = u32::try_from(*perf)?;
-                    layer.node_mask = nodemask_from_nodes(nodes) as u64;
-                    for topo_node in topo.nodes() {
-                        if !nodes.contains(&topo_node.id()) {
-                            continue;
-                        }
-                        layer.cache_mask |= cachemask_from_llcs(&topo_node.llcs()) as u64;
-                    }
-                }
-            }
+                } = spec.kind.common();
 
-            match &spec.kind {
-                LayerKind::Open { .. } | LayerKind::Grouped { .. } => {
-                    layer.open.write(true);
+                layer.slice_ns = *slice_us * 1000;
+                layer.fifo.write(*fifo);
+                layer.min_exec_ns = min_exec_us * 1000;
+                layer.yield_step_ns = if *yield_ignore > 0.999 {
+                    0
+                } else if *yield_ignore < 0.001 {
+                    layer.slice_ns
+                } else {
+                    (layer.slice_ns as f64 * (1.0 - *yield_ignore)) as u64
+                };
+                let mut layer_name: String = spec.name.clone();
+                layer_name.truncate(MAX_LAYER_NAME);
+                copy_into_cstr(&mut layer.name, layer_name.as_str());
+                layer.preempt.write(*preempt);
+                layer.preempt_first.write(*preempt_first);
+                layer.exclusive.write(*exclusive);
+                layer.allow_node_aligned.write(*allow_node_aligned);
+                layer.growth_algo = growth_algo.as_bpf_enum();
+                layer.weight = *weight;
+                layer.disallow_open_after_ns = match disallow_open_after_us.unwrap() {
+                    v if v == u64::MAX => v,
+                    v => v * 1000,
+                };
+                layer.disallow_preempt_after_ns = match disallow_preempt_after_us.unwrap() {
+                    v if v == u64::MAX => v,
+                    v => v * 1000,
+                };
+                layer.xllc_mig_min_ns = (xllc_mig_min_us * 1000.0) as u64;
+                layer_weights.push(layer.weight.try_into().unwrap());
+                layer.perf = u32::try_from(*perf)?;
+                layer.node_mask = nodemask_from_nodes(nodes) as u64;
+                for (topo_node_id, topo_node) in &topo.nodes {
+                    if !nodes.is_empty() && !nodes.contains(topo_node_id) {
+                        continue;
+                    }
+                    layer.llc_mask |= llcmask_from_llcs(&topo_node.llcs) as u64;
                 }
-                _ => {}
             }
 
             perf_set |= layer.perf > 0;
@@ -1371,77 +1327,383 @@ impl<'a> Scheduler<'a> {
     }
 
     fn init_nodes(skel: &mut OpenBpfSkel, _opts: &Opts, topo: &Topology) {
-        skel.maps.rodata_data.nr_nodes = topo.nodes().len() as u32;
+        skel.maps.rodata_data.nr_nodes = topo.nodes.len() as u32;
         skel.maps.rodata_data.nr_llcs = 0;
 
-        for node in topo.nodes() {
-            debug!(
-                "configuring node {}, LLCs {:?}",
-                node.id(),
-                node.llcs().len()
-            );
-            skel.maps.rodata_data.nr_llcs += node.llcs().len() as u32;
-            let raw_numa_slice = node.span().as_raw_slice();
-            let node_cpumask_slice = &mut skel.maps.rodata_data.numa_cpumasks[node.id()];
+        for (&node_id, node) in &topo.nodes {
+            debug!("configuring node {}, LLCs {:?}", node_id, node.llcs.len());
+            skel.maps.rodata_data.nr_llcs += node.llcs.len() as u32;
+            let raw_numa_slice = node.span.as_raw_slice();
+            let node_cpumask_slice = &mut skel.maps.rodata_data.numa_cpumasks[node_id];
             let (left, _) = node_cpumask_slice.split_at_mut(raw_numa_slice.len());
             left.clone_from_slice(raw_numa_slice);
             debug!(
                 "node {} mask: {:?}",
-                node.id(),
-                skel.maps.rodata_data.numa_cpumasks[node.id()]
+                node_id, skel.maps.rodata_data.numa_cpumasks[node_id]
             );
 
-            for (_, llc) in node.llcs() {
-                debug!("configuring llc {:?} for node {:?}", llc.id(), node.id());
-                skel.maps.rodata_data.llc_numa_id_map[llc.id()] = node.id() as u32;
+            for llc in node.llcs.values() {
+                debug!("configuring llc {:?} for node {:?}", llc.id, node_id);
+                skel.maps.rodata_data.llc_numa_id_map[llc.id] = node_id as u32;
             }
         }
 
-        for (_, cpu) in topo.cpus() {
-            skel.maps.rodata_data.cpu_llc_id_map[cpu.id()] = cpu.llc_id() as u32;
+        for cpu in topo.all_cpus.values() {
+            skel.maps.rodata_data.cpu_llc_id_map[cpu.id] = cpu.llc_id as u32;
         }
     }
 
+    fn init_cpu_prox_map(topo: &Topology, cpu_ctxs: &mut [bpf_intf::cpu_ctx]) {
+        let radiate = |mut vec: Vec<usize>, center_id: usize| -> Vec<usize> {
+            vec.sort_by_key(|&id| (center_id as i32 - id as i32).abs());
+            vec
+        };
+        let radiate_cpu =
+            |mut vec: Vec<usize>, center_cpu: usize, center_core: usize| -> Vec<usize> {
+                vec.sort_by_key(|&id| {
+                    (
+                        (center_core as i32 - topo.all_cpus.get(&id).unwrap().core_id as i32).abs(),
+                        (center_cpu as i32 - id as i32).abs(),
+                    )
+                });
+                vec
+            };
+
+        for (&cpu_id, cpu) in &topo.all_cpus {
+            // Collect the spans.
+            let mut core_span = topo.all_cores[&cpu.core_id].span.clone();
+            let llc_span = &topo.all_llcs[&cpu.llc_id].span;
+            let node_span = &topo.nodes[&cpu.node_id].span;
+            let sys_span = &topo.span;
+
+            // Make the spans exclusive.
+            let sys_span = sys_span.and(&node_span.not());
+            let node_span = node_span.and(&llc_span.not());
+            let llc_span = llc_span.and(&core_span.not());
+            core_span.clear_cpu(cpu_id).unwrap();
+
+            // Convert them into arrays.
+            let mut sys_order: Vec<usize> = sys_span.iter().collect();
+            let mut node_order: Vec<usize> = node_span.iter().collect();
+            let mut llc_order: Vec<usize> = llc_span.iter().collect();
+            let mut core_order: Vec<usize> = core_span.iter().collect();
+
+            // Shuffle them so that different CPUs follow different orders.
+            // Each CPU radiates in both directions based on the cpu id and
+            // radiates out to the closest cores based on core ids.
+
+            sys_order = radiate_cpu(sys_order, cpu_id, cpu.core_id);
+            node_order = radiate(node_order, cpu.node_id);
+            llc_order = radiate_cpu(llc_order, cpu_id, cpu.core_id);
+            core_order = radiate_cpu(core_order, cpu_id, cpu.core_id);
+
+            // Concatenate and record the topology boundaries.
+            let mut order: Vec<usize> = vec![];
+            let mut idx: usize = 0;
+
+            idx += 1;
+            order.push(cpu_id);
+
+            idx += core_order.len();
+            order.append(&mut core_order);
+            let core_end = idx;
+
+            idx += llc_order.len();
+            order.append(&mut llc_order);
+            let llc_end = idx;
+
+            idx += node_order.len();
+            order.append(&mut node_order);
+            let node_end = idx;
+
+            idx += sys_order.len();
+            order.append(&mut sys_order);
+            let sys_end = idx;
+
+            debug!(
+                "CPU[{}] proximity map[{}/{}/{}/{}]: {:?}",
+                cpu_id, core_end, llc_end, node_end, sys_end, &order
+            );
+
+            // Record in cpu_ctx.
+            let pmap = &mut cpu_ctxs[cpu_id].prox_map;
+            for (i, &cpu) in order.iter().enumerate() {
+                pmap.cpus[i] = cpu as u16;
+            }
+            pmap.core_end = core_end as u32;
+            pmap.llc_end = llc_end as u32;
+            pmap.node_end = node_end as u32;
+            pmap.sys_end = sys_end as u32;
+        }
+    }
+
+    fn convert_cpu_ctxs(cpu_ctxs: Vec<bpf_intf::cpu_ctx>) -> Vec<Vec<u8>> {
+        cpu_ctxs
+            .into_iter()
+            .map(|cpu_ctx| {
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(
+                        &cpu_ctx as *const bpf_intf::cpu_ctx as *const u8,
+                        std::mem::size_of::<bpf_intf::cpu_ctx>(),
+                    )
+                };
+                bytes.to_vec()
+            })
+            .collect()
+    }
+
+    fn init_cpus(skel: &BpfSkel, layer_specs: &[LayerSpec], topo: &Topology) -> Result<()> {
+        let key = (0_u32).to_ne_bytes();
+        let mut cpu_ctxs: Vec<bpf_intf::cpu_ctx> = vec![];
+        let cpu_ctxs_vec = skel
+            .maps
+            .cpu_ctxs
+            .lookup_percpu(&key, libbpf_rs::MapFlags::ANY)
+            .context("Failed to lookup cpu_ctx")?
+            .unwrap();
+
+        let op_layers: Vec<u32> = layer_specs
+            .iter()
+            .enumerate()
+            .filter(|(_idx, spec)| match &spec.kind {
+                LayerKind::Open { .. } => spec.kind.common().preempt,
+                _ => false,
+            })
+            .map(|(idx, _)| idx as u32)
+            .collect();
+        let on_layers: Vec<u32> = layer_specs
+            .iter()
+            .enumerate()
+            .filter(|(_idx, spec)| match &spec.kind {
+                LayerKind::Open { .. } => !spec.kind.common().preempt,
+                _ => false,
+            })
+            .map(|(idx, _)| idx as u32)
+            .collect();
+        let gp_layers: Vec<u32> = layer_specs
+            .iter()
+            .enumerate()
+            .filter(|(_idx, spec)| match &spec.kind {
+                LayerKind::Grouped { .. } => spec.kind.common().preempt,
+                _ => false,
+            })
+            .map(|(idx, _)| idx as u32)
+            .collect();
+        let gn_layers: Vec<u32> = layer_specs
+            .iter()
+            .enumerate()
+            .filter(|(_idx, spec)| match &spec.kind {
+                LayerKind::Grouped { .. } => !spec.kind.common().preempt,
+                _ => false,
+            })
+            .map(|(idx, _)| idx as u32)
+            .collect();
+
+        // FIXME - this incorrectly assumes all possible CPUs are consecutive.
+        for cpu in 0..*NR_CPUS_POSSIBLE {
+            cpu_ctxs.push(*unsafe {
+                &*(cpu_ctxs_vec[cpu].as_slice().as_ptr() as *const bpf_intf::cpu_ctx)
+            });
+
+            let topo_cpu = topo.all_cpus.get(&cpu).unwrap();
+            let is_big = topo_cpu.core_type == CoreType::Big { turbo: true };
+            cpu_ctxs[cpu].cpu = cpu as i32;
+            cpu_ctxs[cpu].layer_id = MAX_LAYERS as u32;
+            cpu_ctxs[cpu].task_layer_id = MAX_LAYERS as u32;
+            cpu_ctxs[cpu].is_big = is_big;
+
+            fastrand::seed(cpu as u64);
+
+            let mut ogp_order = op_layers.clone();
+            ogp_order.append(&mut gp_layers.clone());
+            fastrand::shuffle(&mut ogp_order);
+
+            let mut ogn_order = on_layers.clone();
+            ogn_order.append(&mut gn_layers.clone());
+            fastrand::shuffle(&mut ogn_order);
+
+            let mut op_order = op_layers.clone();
+            fastrand::shuffle(&mut op_order);
+
+            let mut on_order = on_layers.clone();
+            fastrand::shuffle(&mut on_order);
+
+            let mut gp_order = gp_layers.clone();
+            fastrand::shuffle(&mut gp_order);
+
+            let mut gn_order = gn_layers.clone();
+            fastrand::shuffle(&mut gn_order);
+
+            for i in 0..MAX_LAYERS {
+                cpu_ctxs[cpu].ogp_layer_order[i] =
+                    ogp_order.get(i).cloned().unwrap_or(MAX_LAYERS as u32);
+                cpu_ctxs[cpu].ogn_layer_order[i] =
+                    ogn_order.get(i).cloned().unwrap_or(MAX_LAYERS as u32);
+
+                cpu_ctxs[cpu].op_layer_order[i] =
+                    op_order.get(i).cloned().unwrap_or(MAX_LAYERS as u32);
+                cpu_ctxs[cpu].on_layer_order[i] =
+                    on_order.get(i).cloned().unwrap_or(MAX_LAYERS as u32);
+                cpu_ctxs[cpu].gp_layer_order[i] =
+                    gp_order.get(i).cloned().unwrap_or(MAX_LAYERS as u32);
+                cpu_ctxs[cpu].gn_layer_order[i] =
+                    gn_order.get(i).cloned().unwrap_or(MAX_LAYERS as u32);
+            }
+        }
+
+        Self::init_cpu_prox_map(topo, &mut cpu_ctxs);
+
+        skel.maps
+            .cpu_ctxs
+            .update_percpu(
+                &key,
+                &Self::convert_cpu_ctxs(cpu_ctxs),
+                libbpf_rs::MapFlags::ANY,
+            )
+            .context("Failed to update cpu_ctx")?;
+
+        Ok(())
+    }
+
+    fn init_llc_prox_map(skel: &mut BpfSkel, topo: &Topology) -> Result<()> {
+        for (&llc_id, llc) in &topo.all_llcs {
+            // Collect the orders.
+            let mut node_order: Vec<usize> =
+                topo.nodes[&llc.node_id].llcs.keys().cloned().collect();
+            let mut sys_order: Vec<usize> = topo.all_llcs.keys().cloned().collect();
+
+            // Make the orders exclusive.
+            sys_order.retain(|id| !node_order.contains(id));
+            node_order.retain(|&id| id != llc_id);
+
+            // Shufle so that different LLCs follow different orders. See
+            // init_cpu_prox_map().
+            fastrand::seed(llc_id as u64);
+            fastrand::shuffle(&mut sys_order);
+            fastrand::shuffle(&mut node_order);
+
+            // Concatenate and record the node boundary.
+            let mut order: Vec<usize> = vec![];
+            let mut idx: usize = 0;
+
+            idx += 1;
+            order.push(llc_id);
+
+            idx += node_order.len();
+            order.append(&mut node_order);
+            let node_end = idx;
+
+            idx += sys_order.len();
+            order.append(&mut sys_order);
+            let sys_end = idx;
+
+            debug!(
+                "LLC[{}] proximity map[{}/{}]: {:?}",
+                llc_id, node_end, sys_end, &order
+            );
+
+            // Record in llc_ctx.
+            //
+            // XXX - This would be a lot easier if llc_ctx were in the bss.
+            // See BpfStats::read().
+            let key = llc_id as u32;
+            let llc_id_slice =
+                unsafe { std::slice::from_raw_parts((&key as *const u32) as *const u8, 4) };
+            let v = skel
+                .maps
+                .llc_data
+                .lookup(llc_id_slice, libbpf_rs::MapFlags::ANY)
+                .unwrap()
+                .unwrap();
+            let mut llcc = unsafe { *(v.as_slice().as_ptr() as *const bpf_intf::llc_ctx) };
+
+            let pmap = &mut llcc.prox_map;
+            for (i, &llc_id) in order.iter().enumerate() {
+                pmap.llcs[i] = llc_id as u16;
+            }
+            pmap.node_end = node_end as u32;
+            pmap.sys_end = sys_end as u32;
+
+            let v = unsafe {
+                std::slice::from_raw_parts(
+                    &llcc as *const bpf_intf::llc_ctx as *const u8,
+                    std::mem::size_of::<bpf_intf::llc_ctx>(),
+                )
+            };
+
+            skel.maps
+                .llc_data
+                .update(llc_id_slice, v, libbpf_rs::MapFlags::ANY)?
+        }
+
+        Ok(())
+    }
+
     fn init(
-        opts: &Opts,
+        opts: &'a Opts,
         layer_specs: &[LayerSpec],
         open_object: &'a mut MaybeUninit<OpenObject>,
     ) -> Result<Self> {
         let nr_layers = layer_specs.len();
-        let topo = Topology::new()?;
-        let cpu_pool = CpuPool::new(&topo)?;
+        let mut disable_topology = opts.disable_topology.unwrap_or(false);
 
-        let disable_topology = if let Some(val) = opts.disable_topology {
-            val
+        let topo = Arc::new(if disable_topology {
+            Topology::with_flattened_llc_node()?
         } else {
-            let val = if topo.nodes().len() > 1 {
-                false
-            } else {
-                topo.nodes().iter().all(|n| n.llcs().len() <= 1)
+            Topology::new()?
+        });
+
+        /*
+         * FIXME: scx_layered incorrectly assumes that node, LLC and CPU IDs
+         * are consecutive. Verify that they are on this system and bail if
+         * not. It's lucky that core ID is not used anywhere as core IDs are
+         * not consecutive on some Ryzen CPUs.
+         */
+        if topo.nodes.keys().enumerate().any(|(i, &k)| i != k) {
+            bail!("Holes in node IDs detected: {:?}", topo.nodes.keys());
+        }
+        if topo.all_llcs.keys().enumerate().any(|(i, &k)| i != k) {
+            bail!("Holes in LLC IDs detected: {:?}", topo.all_llcs.keys());
+        }
+        if topo.all_cpus.keys().enumerate().any(|(i, &k)| i != k) {
+            bail!("Holes in CPU IDs detected: {:?}", topo.all_cpus.keys());
+        }
+
+        let netdevs = if opts.netdev_irq_balance {
+            warn!(
+                "Experimental netdev IRQ balancing enabled. Reset IRQ masks of network devices after use!!!"
+            );
+            read_netdevs()?
+        } else {
+            BTreeMap::new()
+        };
+
+        if !disable_topology {
+            if topo.nodes.len() == 1 && topo.nodes[&0].llcs.len() == 1 {
+                disable_topology = true;
             };
             info!(
                 "Topology awareness not specified, selecting {} based on hardware",
-                if val { "disabled" } else { "enabled" }
+                if disable_topology {
+                    "disabled"
+                } else {
+                    "enabled"
+                }
             );
-            val
         };
+
+        let cpu_pool = CpuPool::new(topo.clone())?;
 
         // If disabling topology awareness clear out any set NUMA/LLC configs and
         // it will fallback to using all cores.
         let layer_specs: Vec<_> = if disable_topology {
             info!("Disabling topology awareness");
             layer_specs
-                .into_iter()
+                .iter()
                 .cloned()
                 .map(|mut s| {
-                    match &mut s.kind {
-                        LayerKind::Confined { nodes, llcs, .. }
-                        | LayerKind::Open { nodes, llcs, .. }
-                        | LayerKind::Grouped { nodes, llcs, .. } => {
-                            nodes.truncate(0);
-                            llcs.truncate(0);
-                        }
-                    };
+                    s.kind.common_mut().nodes.clear();
+                    s.kind.common_mut().llcs.clear();
                     s
                 })
                 .collect()
@@ -1454,20 +1716,18 @@ impl<'a> Scheduler<'a> {
         skel_builder.obj_builder.debug(opts.verbose > 1);
         init_libbpf_logging(None);
         let mut skel = scx_ops_open!(skel_builder, open_object, layered)?;
-
-        // scheduler_tick() got renamed to sched_tick() during v6.10-rc.
-        let sched_tick_name = match compat::ksym_exists("sched_tick")? {
-            true => "sched_tick",
-            false => "scheduler_tick",
-        };
-
-        skel.progs
-            .sched_tick_fentry
-            .set_attach_target(0, Some(sched_tick_name.into()))
-            .context("Failed to set attach target for sched_tick_fentry()")?;
+        skel.maps.rodata_data.slice_ns = scx_enums.SCX_SLICE_DFL;
+        skel.maps.rodata_data.max_exec_ns = 20 * scx_enums.SCX_SLICE_DFL;
 
         // Initialize skel according to @opts.
         skel.struct_ops.layered_mut().exit_dump_len = opts.exit_dump_len;
+
+        if !opts.disable_queued_wakeup {
+            match *compat::SCX_OPS_ALLOW_QUEUED_WAKEUP {
+                0 => info!("Kernel does not support queued wakeup optimization"),
+                v => skel.struct_ops.layered_mut().flags |= v,
+            }
+        }
 
         skel.maps.rodata_data.debug = opts.verbose as u32;
         skel.maps.rodata_data.slice_ns = opts.slice_us * 1000;
@@ -1476,30 +1736,108 @@ impl<'a> Scheduler<'a> {
         } else {
             opts.slice_us * 1000 * 20
         };
-        skel.maps.rodata_data.nr_possible_cpus = *NR_POSSIBLE_CPUS as u32;
-        skel.maps.rodata_data.smt_enabled = cpu_pool.nr_cpus > cpu_pool.nr_cores;
+        skel.maps.rodata_data.nr_cpu_ids = *NR_CPU_IDS as u32;
+        skel.maps.rodata_data.nr_possible_cpus = *NR_CPUS_POSSIBLE as u32;
+        skel.maps.rodata_data.smt_enabled = topo.all_cpus.len() > topo.all_cores.len();
         skel.maps.rodata_data.has_little_cores = topo.has_little_cores();
-        skel.maps.rodata_data.disable_topology = disable_topology;
         skel.maps.rodata_data.xnuma_preemption = opts.xnuma_preemption;
-        for (cpu, sib) in cpu_pool.sibling_cpu.iter().enumerate() {
+        skel.maps.rodata_data.antistall_sec = opts.antistall_sec;
+        skel.maps.rodata_data.monitor_disable = opts.monitor_disable;
+        skel.maps.rodata_data.lo_fb_wait_ns = opts.lo_fb_wait_us * 1000;
+        skel.maps.rodata_data.lo_fb_share_ppk = ((opts.lo_fb_share * 1024.0) as u32).clamp(1, 1024);
+        skel.maps.rodata_data.enable_antistall = !opts.disable_antistall;
+        skel.maps.rodata_data.enable_gpu_support = opts.enable_gpu_support;
+
+        for (cpu, sib) in topo.sibling_cpus().iter().enumerate() {
             skel.maps.rodata_data.__sibling_cpu[cpu] = *sib;
         }
-        for cpu in cpu_pool.all_cpus.iter_ones() {
+        for cpu in topo.all_cpus.keys() {
             skel.maps.rodata_data.all_cpus[cpu / 8] |= 1 << (cpu % 8);
         }
-        Self::init_layers(&mut skel, opts, &layer_specs, &topo)?;
+
+        skel.maps.rodata_data.nr_op_layers = layer_specs
+            .iter()
+            .filter(|spec| match &spec.kind {
+                LayerKind::Open { .. } => spec.kind.common().preempt,
+                _ => false,
+            })
+            .count() as u32;
+        skel.maps.rodata_data.nr_on_layers = layer_specs
+            .iter()
+            .filter(|spec| match &spec.kind {
+                LayerKind::Open { .. } => !spec.kind.common().preempt,
+                _ => false,
+            })
+            .count() as u32;
+        skel.maps.rodata_data.nr_gp_layers = layer_specs
+            .iter()
+            .filter(|spec| match &spec.kind {
+                LayerKind::Grouped { .. } => spec.kind.common().preempt,
+                _ => false,
+            })
+            .count() as u32;
+        skel.maps.rodata_data.nr_gn_layers = layer_specs
+            .iter()
+            .filter(|spec| match &spec.kind {
+                LayerKind::Grouped { .. } => !spec.kind.common().preempt,
+                _ => false,
+            })
+            .count() as u32;
+
+        let mut min_open = u64::MAX;
+        let mut min_preempt = u64::MAX;
+
+        for spec in layer_specs.iter() {
+            if let LayerKind::Open { common, .. } = &spec.kind {
+                min_open = min_open.min(common.disallow_open_after_us.unwrap());
+                min_preempt = min_preempt.min(common.disallow_preempt_after_us.unwrap());
+            }
+        }
+
+        skel.maps.rodata_data.min_open_layer_disallow_open_after_ns = match min_open {
+            u64::MAX => *DFL_DISALLOW_OPEN_AFTER_US,
+            v => v,
+        };
+        skel.maps
+            .rodata_data
+            .min_open_layer_disallow_preempt_after_ns = match min_preempt {
+            u64::MAX => *DFL_DISALLOW_PREEMPT_AFTER_US,
+            v => v,
+        };
+
+        // Consider all layers empty at the beginning.
+        for i in 0..layer_specs.len() {
+            skel.maps.bss_data.empty_layer_ids[i] = i as u32;
+        }
+        skel.maps.bss_data.nr_empty_layer_ids = nr_layers as u32;
+
+        Self::init_layers(&mut skel, &layer_specs, &topo)?;
         Self::init_nodes(&mut skel, opts, &topo);
 
         let mut skel = scx_ops_load!(skel, layered, uei)?;
 
         let mut layers = vec![];
+        let layer_growth_orders =
+            LayerGrowthAlgo::layer_core_orders(&cpu_pool, &layer_specs, &topo);
         for (idx, spec) in layer_specs.iter().enumerate() {
-            layers.push(Layer::new(&spec, idx, &cpu_pool, &topo)?);
+            let growth_order = layer_growth_orders
+                .get(&idx)
+                .with_context(|| "layer has no growth order".to_string())?;
+            layers.push(Layer::new(spec, &topo, growth_order)?);
         }
-        initialize_cpu_ctxs(&skel, &topo).unwrap();
+
+        Self::init_cpus(&skel, &layer_specs, &topo)?;
+        Self::init_llc_prox_map(&mut skel, &topo)?;
 
         // Other stuff.
         let proc_reader = procfs::ProcReader::new();
+
+        // Handle setup if layered is running in a pid namespace.
+        let input = ProgramInput {
+            ..Default::default()
+        };
+        let prog = &mut skel.progs.initialize_pid_namespace;
+        let _ = prog.test_run(input);
 
         // XXX If we try to refresh the cpumasks here before attaching, we
         // sometimes (non-deterministically) don't see the updated values in
@@ -1510,6 +1848,14 @@ impl<'a> Scheduler<'a> {
         // Attach.
         let struct_ops = scx_ops_attach!(skel, layered)?;
         let stats_server = StatsServer::new(stats::server_data()).launch()?;
+        let gpu_mon_data = GpuMonData {
+            sysinfo_sys: System::new_with_specifics(
+                sysinfo::RefreshKind::nothing()
+                    .with_processes(sysinfo::ProcessRefreshKind::everything()),
+            ),
+            last_nvml_poll: std::time::SystemTime::now(),
+            gpu_pidmap: HashMap::new(),
+        };
 
         let sched = Self {
             struct_ops: Some(struct_ops),
@@ -1520,9 +1866,6 @@ impl<'a> Scheduler<'a> {
             cpu_pool,
             layers,
 
-            layer_preempt_weight_disable: opts.layer_preempt_weight_disable,
-            layer_growth_weight_disable: opts.layer_growth_weight_disable,
-
             sched_stats: Stats::new(&mut skel, &proc_reader)?,
 
             nr_layer_cpus_ranges: vec![(0, 0); nr_layers],
@@ -1531,7 +1874,11 @@ impl<'a> Scheduler<'a> {
             proc_reader,
             skel,
 
+            topo,
+            netdevs,
             stats_server,
+            opts,
+            gpu_mon_data,
         };
 
         info!("Layered Scheduler Attached. Run `scx_layered --monitor` for metrics.");
@@ -1540,118 +1887,457 @@ impl<'a> Scheduler<'a> {
     }
 
     fn update_bpf_layer_cpumask(layer: &Layer, bpf_layer: &mut types::layer) {
-        for bit in 0..layer.cpus.len() {
-            if layer.cpus[bit] {
-                bpf_layer.cpus[bit / 8] |= 1 << (bit % 8);
+        trace!("[{}] Updating BPF CPUs: {}", layer.name, &layer.cpus);
+        for cpu in 0..layer.cpus.len() {
+            if layer.cpus.test_cpu(cpu) {
+                bpf_layer.cpus[cpu / 8] |= 1 << (cpu % 8);
             } else {
-                bpf_layer.cpus[bit / 8] &= !(1 << (bit % 8));
+                bpf_layer.cpus[cpu / 8] &= !(1 << (cpu % 8));
             }
         }
+
+        bpf_layer.nr_cpus = layer.nr_cpus as u32;
+        for (llc_id, &nr_llc_cpus) in layer.nr_llc_cpus.iter().enumerate() {
+            bpf_layer.nr_llc_cpus[llc_id] = nr_llc_cpus as u32;
+        }
+
         bpf_layer.refresh_cpus = 1;
     }
 
-    fn set_bpf_layer_preemption(layer: &mut Layer, bpf_layer: &mut types::layer, preempt: bool) {
-        layer.preempt = preempt;
-        bpf_layer.preempt.write(preempt);
+    fn update_netdev_cpumasks(&mut self) -> Result<()> {
+        let available_cpus = self.cpu_pool.available_cpus();
+        if available_cpus.is_empty() {
+            return Ok(());
+        }
+
+        for (iface, netdev) in self.netdevs.iter_mut() {
+            let node = self
+                .topo
+                .nodes
+                .values()
+                .take_while(|n| n.id == netdev.node())
+                .next()
+                .ok_or_else(|| anyhow!("Failed to get netdev node"))?;
+            let node_cpus = node.span.clone();
+            for (irq, irqmask) in netdev.irqs.iter_mut() {
+                irqmask.clear_all();
+                for cpu in available_cpus.iter() {
+                    if !node_cpus.test_cpu(cpu) {
+                        continue;
+                    }
+                    let _ = irqmask.set_cpu(cpu);
+                }
+                // If no CPUs are available in the node then spread the load across the node
+                if irqmask.weight() == 0 {
+                    for cpu in node_cpus.iter() {
+                        let _ = irqmask.set_cpu(cpu);
+                    }
+                }
+                trace!("{} updating irq {} cpumask {:?}", iface, irq, irqmask);
+            }
+            netdev.apply_cpumasks()?;
+        }
+
+        Ok(())
     }
 
-    fn refresh_cpumasks(&mut self) -> Result<()> {
-        let mut updated = false;
-        let num_layers = self.layers.len();
+    fn update_gpu_pids(&mut self) -> Result<()> {
+        if !self.opts.enable_gpu_support {
+            return Ok(());
+        }
 
-        for idx in 0..num_layers {
-            match self.layers[idx].kind {
-                LayerKind::Confined {
-                    cpus_range,
-                    util_range,
-                    ..
-                }
-                | LayerKind::Grouped {
-                    cpus_range,
-                    util_range,
-                    ..
-                } => {
-                    let load = (
-                        self.sched_stats.layer_load_sums[idx],
-                        self.sched_stats.total_load_sum,
-                    );
-                    let util = (
-                        self.sched_stats.layer_utils[idx],
-                        self.sched_stats.total_util,
-                    );
+        let nvml = NVML_CELL.get_or_try_init(|| {
+            Nvml::init().context("enabling GPU support requires a nvidia device")
+        })?;
 
-                    // If the layer is utilizing all the adjusted load, disable
-                    // preemption
-                    if self.layers[idx].can_preempt && self.layer_preempt_weight_disable > 0.0 {
-                        let weighted_load = load.0 / load.1;
+        let mut missing_gpu_pid = false;
 
-                        if weighted_load < self.layer_preempt_weight_disable
-                            && !self.layers[idx].preempt
-                        {
-                            trace!(
-                                "enabling bpf layer preemption for {} load {:2.3} < {:2.3}",
-                                &self.layers[idx].name,
-                                weighted_load,
-                                self.layer_preempt_weight_disable,
-                            );
-                            Self::set_bpf_layer_preemption(
-                                &mut self.layers[idx],
-                                &mut self.skel.maps.bss_data.layers[idx],
-                                true,
-                            );
+        if !self.opts.aggressive_nvml_polling {
+            self.gpu_mon_data.sysinfo_sys.refresh_processes_specifics(
+                sysinfo::ProcessesToUpdate::All,
+                true,
+                sysinfo::ProcessRefreshKind::nothing(),
+            );
+            let current_pidmap = self.gpu_mon_data.sysinfo_sys.processes();
+            if self.gpu_mon_data.gpu_pidmap.is_empty() {
+                missing_gpu_pid = true;
+            } else {
+                for (k, v) in self.gpu_mon_data.gpu_pidmap.iter() {
+                    let k_pid = sysinfo::Pid::from_u32(k.clone());
+                    if current_pidmap.contains_key(&k_pid) {
+                        if v.clone() < current_pidmap.get(&k_pid).unwrap().start_time() {
+                            missing_gpu_pid = true;
+                            break;
                         }
-                        if weighted_load >= self.layer_preempt_weight_disable {
-                            trace!(
-                                "disabling bpf layer preemption for {} load {:2.3} > {:2.3}",
-                                &self.layers[idx].name,
-                                weighted_load,
-                                self.layer_preempt_weight_disable,
-                            );
-                            Self::set_bpf_layer_preemption(
-                                &mut self.layers[idx],
-                                &mut self.skel.maps.bss_data.layers[idx],
-                                false,
-                            );
-                        }
-                    }
-
-                    if self.layers[idx].resize_confined_or_grouped(
-                        &mut self.cpu_pool,
-                        cpus_range,
-                        util_range,
-                        self.layer_growth_weight_disable,
-                        load,
-                        util,
-                    )? != 0
-                    {
-                        Self::update_bpf_layer_cpumask(
-                            &self.layers[idx],
-                            &mut self.skel.maps.bss_data.layers[idx],
-                        );
-                        updated = true;
+                    } else {
+                        missing_gpu_pid = true;
+                        break;
                     }
                 }
-                _ => {}
             }
         }
 
-        if updated {
-            for idx in 0..num_layers {
-                let layer = &mut self.layers[idx];
-                let bpf_layer = &mut self.skel.maps.bss_data.layers[idx];
-                match &layer.kind {
-                    LayerKind::Open { .. } => {
-                        let available_cpus =
-                            self.cpu_pool.available_cpus_in_mask(&layer.allowed_cpus);
-                        let nr_available_cpus = available_cpus.count_ones();
-                        // Open layers need the intersection of allowed
-                        // cpus and available cpus.
-                        layer.cpus.copy_from_bitslice(&available_cpus);
-                        layer.nr_cpus = nr_available_cpus;
-                        Self::update_bpf_layer_cpumask(layer, bpf_layer);
-                    }
-                    _ => {}
+        let time_since_last_update = std::time::SystemTime::now()
+            .duration_since(self.gpu_mon_data.last_nvml_poll)?
+            .as_secs();
+        let since_last_update_short = time_since_last_update > self.opts.gpu_poll_short_interval;
+        let since_last_update_600s = time_since_last_update > 600;
+
+        if self.opts.aggressive_nvml_polling
+            || (missing_gpu_pid && since_last_update_short)
+            || (since_last_update_600s)
+        {
+            debug!("calling NVML to update GPU pids");
+            self.gpu_mon_data.last_nvml_poll = std::time::SystemTime::now();
+            let device_count = nvml.device_count()?;
+
+            let mut pids = HashSet::new();
+
+            // Iterate over all devices and gather running processes
+            for i in 0..device_count {
+                let device = nvml.device_by_index(i)?;
+
+                let procs = device.running_compute_processes()?;
+
+                for proc_info in procs {
+                    pids.insert(proc_info.pid);
                 }
+            }
+
+            // ensure current pids only have current pids.
+            let zero = 0;
+            let all_pid_bpf_map = MapHandle::try_from(&self.skel.maps.all_gpu_pid)?;
+            let cur_pid_bpf_map = MapHandle::try_from(&self.skel.maps.cur_gpu_pid)?;
+
+            // get deletes for current, state of the world for all.
+            let mut cur_pid_bpf_set = HashSet::new();
+            let mut all_pid_bpf_set = HashSet::new();
+
+            for key in cur_pid_bpf_map.keys() {
+                let sized_bytes: [u8; 4] = key
+                    .try_into()
+                    .expect("failed to convert pid bytes to sized bytes");
+                let pid: u32 = u32::from_ne_bytes(sized_bytes);
+                cur_pid_bpf_set.insert(pid);
+            }
+            for key in all_pid_bpf_map.keys() {
+                let sized_bytes: [u8; 4] = key
+                    .try_into()
+                    .expect("failed to convert pid bytes to sized bytes");
+                let pid: u32 = u32::from_ne_bytes(sized_bytes);
+                all_pid_bpf_set.insert(pid);
+            }
+
+            let cur_delete_set = cur_pid_bpf_set.difference(&pids);
+            let cur_add_set = pids.difference(&pids);
+            let all_add_set = pids.difference(&all_pid_bpf_set);
+
+            let zero_bytes: &[u8; 4] = unsafe { std::mem::transmute(&zero) };
+            use libbpf_rs::MapFlags;
+            for pid in cur_add_set {
+                let pid_bytes: &[u8; 4] = unsafe { std::mem::transmute(&pid) };
+                cur_pid_bpf_map.update(pid_bytes, zero_bytes, MapFlags::ANY)?;
+            }
+
+            for pid in cur_delete_set {
+                let pid_bytes: &[u8; 4] = unsafe { std::mem::transmute(&pid) };
+                cur_pid_bpf_map.delete(pid_bytes)?;
+            }
+
+            for pid in all_add_set {
+                let pid_bytes: &[u8; 4] = unsafe { std::mem::transmute(&pid) };
+                all_pid_bpf_map.update(pid_bytes, zero_bytes, MapFlags::ANY)?;
+            }
+            // bookkeeping for non-agressive mode
+            self.gpu_mon_data.sysinfo_sys.refresh_processes_specifics(
+                sysinfo::ProcessesToUpdate::All,
+                true,
+                sysinfo::ProcessRefreshKind::nothing(),
+            );
+            self.gpu_mon_data.gpu_pidmap.clear();
+            for x in pids {
+                let x_pid = sysinfo::Pid::from_u32(x);
+                if self
+                    .gpu_mon_data
+                    .sysinfo_sys
+                    .processes()
+                    .contains_key(&x_pid)
+                {
+                    let proc = self
+                        .gpu_mon_data
+                        .sysinfo_sys
+                        .processes()
+                        .get(&x_pid)
+                        .unwrap();
+                    self.gpu_mon_data.gpu_pidmap.insert(x, proc.start_time());
+                } else {
+                    self.gpu_mon_data.gpu_pidmap.insert(x, 0);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Calculate how many CPUs each layer would like to have if there were
+    /// no competition. The CPU range is determined by applying the inverse
+    /// of util_range and then capping by cpus_range. If the current
+    /// allocation is within the acceptable range, no change is made.
+    /// Returns (target, min) pair for each layer.
+    fn calc_target_nr_cpus(&self) -> Vec<(usize, usize)> {
+        let nr_cpus = self.cpu_pool.topo.all_cpus.len();
+        let utils = &self.sched_stats.layer_utils;
+
+        let mut records: Vec<(u64, u64, u64, usize, usize, usize)> = vec![];
+        let mut targets: Vec<(usize, usize)> = vec![];
+
+        for (idx, layer) in self.layers.iter().enumerate() {
+            targets.push(match &layer.kind {
+                LayerKind::Confined {
+                    util_range,
+                    cpus_range,
+                    ..
+                }
+                | LayerKind::Grouped {
+                    util_range,
+                    cpus_range,
+                    ..
+                } => {
+                    // Guide layer sizing by utilization within each layer
+                    // to avoid oversizing grouped layers. As an empty layer
+                    // can only get CPU time through fallback (counted as
+                    // owned) or open execution, add open cputime for empty
+                    // layers.
+                    let owned = utils[idx][LAYER_USAGE_OWNED];
+                    let open = utils[idx][LAYER_USAGE_OPEN];
+
+                    let mut util = owned;
+                    if layer.nr_cpus == 0 {
+                        util += open;
+                    }
+
+                    let util = if util < 0.01 { 0.0 } else { util };
+                    let low = (util / util_range.1).ceil() as usize;
+                    let high = ((util / util_range.0).floor() as usize).max(low);
+                    let target = layer.cpus.weight().clamp(low, high);
+                    let cpus_range = cpus_range.unwrap_or((0, nr_cpus));
+
+                    records.push((
+                        (owned * 100.0) as u64,
+                        (open * 100.0) as u64,
+                        (util * 100.0) as u64,
+                        low,
+                        high,
+                        target,
+                    ));
+
+                    (target.clamp(cpus_range.0, cpus_range.1), cpus_range.0)
+                }
+                LayerKind::Open { .. } => (0, 0),
+            });
+        }
+
+        trace!("initial targets: {:?}", &targets);
+        trace!("(owned, open, util, low, high, target): {:?}", &records);
+        targets
+    }
+
+    /// Given (target, min) pair for each layer which was determined
+    /// assuming infinite number of CPUs, distribute the actual CPUs
+    /// according to their weights.
+    fn weighted_target_nr_cpus(&self, targets: &[(usize, usize)]) -> Vec<usize> {
+        let mut nr_left = self.cpu_pool.topo.all_cpus.len();
+        let weights: Vec<usize> = self
+            .layers
+            .iter()
+            .map(|layer| layer.kind.common().weight as usize)
+            .collect();
+        let mut cands: BTreeMap<usize, (usize, usize, usize)> = targets
+            .iter()
+            .zip(&weights)
+            .enumerate()
+            .map(|(i, ((target, min), weight))| (i, (*target, *min, *weight)))
+            .collect();
+        let mut weight_sum: usize = weights.iter().sum();
+        let mut weighted: Vec<usize> = vec![0; self.layers.len()];
+
+        trace!("cands: {:?}", &cands);
+
+        // First, accept all layers that are <= min.
+        cands.retain(|&i, &mut (target, min, weight)| {
+            if target <= min {
+                let target = target.min(nr_left);
+                weighted[i] = target;
+                weight_sum -= weight;
+                nr_left -= target;
+                false
+            } else {
+                true
+            }
+        });
+
+        trace!("cands after accepting mins: {:?}", &cands);
+
+        // Keep accepting ones under their allotted share.
+        let calc_share = |nr_left, weight, weight_sum| {
+            (((nr_left * weight) as f64 / weight_sum as f64).ceil() as usize).min(nr_left)
+        };
+
+        while !cands.is_empty() {
+            let mut progress = false;
+
+            cands.retain(|&i, &mut (target, _min, weight)| {
+                let share = calc_share(nr_left, weight, weight_sum);
+                if target <= share {
+                    weighted[i] = target;
+                    weight_sum -= weight;
+                    nr_left -= target;
+                    progress = true;
+                    false
+                } else {
+                    true
+                }
+            });
+
+            if !progress {
+                break;
+            }
+        }
+
+        trace!("cands after accepting under allotted: {:?}", &cands);
+
+        // The remaining candidates are in contention with each other,
+        // distribute according to the shares.
+        let nr_to_share = nr_left;
+        for (i, (_target, _min, weight)) in cands.into_iter() {
+            let share = calc_share(nr_to_share, weight, weight_sum).min(nr_left);
+            weighted[i] = share;
+            nr_left -= share;
+        }
+
+        trace!("weighted: {:?}", &weighted);
+
+        weighted
+    }
+
+    fn refresh_cpumasks(&mut self) -> Result<()> {
+        let layer_is_open = |layer: &Layer| matches!(layer.kind, LayerKind::Open { .. });
+
+        let mut updated = false;
+        let targets = self.calc_target_nr_cpus();
+        let targets = self.weighted_target_nr_cpus(&targets);
+
+        let mut ascending: Vec<(usize, usize)> = targets.iter().copied().enumerate().collect();
+        ascending.sort_by(|a, b| a.1.cmp(&b.1));
+
+        // If any layer is growing, guarantee that the largest layer that is
+        // freeing CPUs frees at least one CPU.
+        let mut force_free = self
+            .layers
+            .iter()
+            .zip(targets.iter())
+            .any(|(layer, &target)| layer.nr_cpus < target);
+
+        // Shrink all layers first so that CPUs are available for
+        // redistribution. Do so in the descending target number of CPUs
+        // order.
+        for &(idx, target) in ascending.iter().rev() {
+            let layer = &mut self.layers[idx];
+            if layer_is_open(layer) {
+                continue;
+            }
+
+            let nr_cur = layer.cpus.weight();
+            if nr_cur <= target {
+                continue;
+            }
+            let mut nr_to_free = nr_cur - target;
+
+            // There's some dampening built into util metrics but slow down
+            // freeing further to avoid unnecessary changes. This is solely
+            // based on intution. Drop or update according to real-world
+            // behavior.
+            let nr_to_break_at = nr_to_free / 2;
+
+            let mut freed = false;
+
+            while nr_to_free > 0 {
+                let max_to_free = if force_free {
+                    force_free = false;
+                    layer.nr_cpus
+                } else {
+                    nr_to_free
+                };
+
+                let nr_freed = layer.free_some_cpus(&mut self.cpu_pool, max_to_free)?;
+                if nr_freed == 0 {
+                    break;
+                }
+
+                nr_to_free = nr_to_free.saturating_sub(nr_freed);
+                freed = true;
+
+                if nr_to_free <= nr_to_break_at {
+                    break;
+                }
+            }
+
+            if freed {
+                Self::update_bpf_layer_cpumask(layer, &mut self.skel.maps.bss_data.layers[idx]);
+                updated = true;
+            }
+        }
+
+        // Grow layers. Do so in the ascending target number of CPUs order
+        // so that we're always more generous to smaller layers. This avoids
+        // starving small layers and shouldn't make noticable difference for
+        // bigger layers as work conservation should still be achieved
+        // through open execution.
+        for &(idx, target) in &ascending {
+            let layer = &mut self.layers[idx];
+
+            if layer_is_open(layer) {
+                continue;
+            }
+
+            let nr_cur = layer.cpus.weight();
+            if nr_cur >= target {
+                continue;
+            }
+
+            let mut nr_to_alloc = target - nr_cur;
+            let mut alloced = false;
+
+            while nr_to_alloc > 0 {
+                let nr_alloced = layer.alloc_some_cpus(&mut self.cpu_pool)?;
+                if nr_alloced == 0 {
+                    break;
+                }
+                alloced = true;
+                nr_to_alloc -= nr_alloced.min(nr_to_alloc);
+            }
+
+            if alloced {
+                Self::update_bpf_layer_cpumask(layer, &mut self.skel.maps.bss_data.layers[idx]);
+                updated = true;
+            }
+        }
+
+        // Give the rest to the open layers.
+        if updated {
+            for (idx, layer) in self.layers.iter_mut().enumerate() {
+                if !layer_is_open(layer) {
+                    continue;
+                }
+
+                let bpf_layer = &mut self.skel.maps.bss_data.layers[idx];
+                let available_cpus = self.cpu_pool.available_cpus().and(&layer.allowed_cpus);
+                let nr_available_cpus = available_cpus.weight();
+
+                // Open layers need the intersection of allowed cpus and
+                // available cpus.
+                layer.cpus = available_cpus;
+                layer.nr_cpus = nr_available_cpus;
+                Self::update_bpf_layer_cpumask(layer, bpf_layer);
             }
 
             self.skel.maps.bss_data.fallback_cpu = self.cpu_pool.fallback_cpu as u32;
@@ -1662,22 +2348,43 @@ impl<'a> Scheduler<'a> {
                     self.nr_layer_cpus_ranges[lidx].1.max(layer.nr_cpus),
                 );
             }
+
+            // Trigger updates on the BPF side.
+            let input = ProgramInput {
+                ..Default::default()
+            };
+            let prog = &mut self.skel.progs.refresh_layer_cpumasks;
+            let _ = prog.test_run(input);
+
+            // Update empty_layers.
+            let empty_layer_ids: Vec<u32> = self
+                .layers
+                .iter()
+                .enumerate()
+                .filter(|(_idx, layer)| layer.nr_cpus == 0)
+                .map(|(idx, _layer)| idx as u32)
+                .collect();
+            for i in 0..self.layers.len() {
+                self.skel.maps.bss_data.empty_layer_ids[i] =
+                    empty_layer_ids.get(i).cloned().unwrap_or(MAX_LAYERS as u32);
+            }
+            self.skel.maps.bss_data.nr_empty_layer_ids = empty_layer_ids.len() as u32;
         }
 
+        let _ = self.update_netdev_cpumasks();
         Ok(())
     }
 
     fn step(&mut self) -> Result<()> {
         let started_at = Instant::now();
-        let mut load_agg = LoadAggregator::new(self.cpu_pool.nr_cpus, false);
         self.sched_stats.refresh(
             &mut self.skel,
             &self.proc_reader,
-            &mut load_agg,
             started_at,
             self.processing_dur,
         )?;
         self.refresh_cpumasks()?;
+        self.update_gpu_pids()?;
         self.processing_dur += Instant::now().duration_since(started_at);
         Ok(())
     }
@@ -1685,7 +2392,7 @@ impl<'a> Scheduler<'a> {
     fn generate_sys_stats(
         &mut self,
         stats: &Stats,
-        cpus_ranges: &mut Vec<(usize, usize)>,
+        cpus_ranges: &mut [(usize, usize)],
     ) -> Result<SysStats> {
         let bstats = &stats.bpf_stats;
         let mut sys_stats = SysStats::new(stats, bstats, self.cpu_pool.fallback_cpu)?;
@@ -1736,14 +2443,7 @@ impl<'a> Scheduler<'a> {
                             (self.layers[i].nr_cpus, self.layers[i].nr_cpus);
                     }
 
-                    let mut load_agg = LoadAggregator::new(self.cpu_pool.nr_cpus, false);
-                    stats.refresh(
-                        &mut self.skel,
-                        &self.proc_reader,
-                        &mut load_agg,
-                        now,
-                        self.processing_dur,
-                    )?;
+                    stats.refresh(&mut self.skel, &self.proc_reader, now, self.processing_dur)?;
                     let sys_stats =
                         self.generate_sys_stats(&stats, cpus_ranges.get_mut(&tid).unwrap())?;
                     res_ch.send(StatsRes::Refreshed((stats, sys_stats)))?;
@@ -1762,7 +2462,7 @@ impl<'a> Scheduler<'a> {
     }
 }
 
-impl<'a> Drop for Scheduler<'a> {
+impl Drop for Scheduler<'_> {
     fn drop(&mut self) {
         if let Some(struct_ops) = self.struct_ops.take() {
             drop(struct_ops);
@@ -1789,11 +2489,11 @@ fn verify_layer_specs(specs: &[LayerSpec]) -> Result<()> {
 
     for (idx, spec) in specs.iter().enumerate() {
         if idx < nr_specs - 1 {
-            if spec.matches.len() == 0 {
+            if spec.matches.is_empty() {
                 bail!("Non-terminal spec {:?} has NULL matches", spec.name);
             }
         } else {
-            if spec.matches.len() != 1 || spec.matches[0].len() != 0 {
+            if spec.matches.len() != 1 || !spec.matches[0].is_empty() {
                 bail!("Terminal spec {:?} must have an empty match", spec.name);
             }
         }
@@ -1881,19 +2581,18 @@ fn main() -> Result<()> {
         stats::server_data().describe_meta(&mut std::io::stdout(), None)?;
         return Ok(());
     }
-    // clap doesn't properly parse floats, so need to do a bounds check here, see:
-    // https://github.com/clap-rs/clap/issues/4253
-    if opts.layer_preempt_weight_disable < 0.0 || opts.layer_preempt_weight_disable > 1.0 {
-        bail!(
-            "invalid value {:2.2} for layer_preempt_weight_disable, must be 0.0..1.0",
-            opts.layer_preempt_weight_disable
-        );
+
+    if opts.no_load_frac_limit {
+        warn!("--no-load-frac-limit is deprecated and noop");
     }
-    if opts.layer_growth_weight_disable < 0.0 || opts.layer_growth_weight_disable > 1.0 {
-        bail!(
-            "invalid value {:2.2} for layer_growth_weight_disable, must be 0.0..1.0",
-            opts.layer_growth_weight_disable
-        );
+    if opts.layer_preempt_weight_disable != 0.0 {
+        warn!("--layer-preempt-weight-disable is deprecated and noop");
+    }
+    if opts.layer_growth_weight_disable != 0.0 {
+        warn!("--layer-growth-weight-disable is deprecated and noop");
+    }
+    if opts.local_llc_iteration {
+        warn!("--local_llc_iteration is deprecated and noop");
     }
 
     let llv = match opts.verbose {
@@ -1925,7 +2624,17 @@ fn main() -> Result<()> {
     if let Some(intv) = opts.monitor.or(opts.stats) {
         let shutdown_copy = shutdown.clone();
         let jh = std::thread::spawn(move || {
-            stats::monitor(Duration::from_secs_f64(intv), shutdown_copy).unwrap()
+            match stats::monitor(Duration::from_secs_f64(intv), shutdown_copy) {
+                Ok(_) => {
+                    debug!("stats monitor thread finished successfully")
+                }
+                Err(error_object) => {
+                    warn!(
+                        "stats monitor thread finished because of an error {}",
+                        error_object
+                    )
+                }
+            }
         });
         if opts.monitor.is_some() {
             let _ = jh.join();
@@ -1948,6 +2657,48 @@ fn main() -> Result<()> {
             &mut LayerSpec::parse(input)
                 .context(format!("Failed to parse specs[{}] ({:?})", idx, input))?,
         );
+    }
+
+    for spec in layer_config.specs.iter_mut() {
+        let common = spec.kind.common_mut();
+
+        if common.slice_us == 0 {
+            common.slice_us = opts.slice_us;
+        }
+
+        if common.weight == 0 {
+            common.weight = DEFAULT_LAYER_WEIGHT;
+        }
+        common.weight = common.weight.clamp(MIN_LAYER_WEIGHT, MAX_LAYER_WEIGHT);
+
+        if common.preempt {
+            if common.disallow_open_after_us.is_some() {
+                warn!(
+                    "Preempt layer {} has non-null disallow_open_after_us, ignored",
+                    &spec.name
+                );
+            }
+            if common.disallow_preempt_after_us.is_some() {
+                warn!(
+                    "Preempt layer {} has non-null disallow_preempt_after_us, ignored",
+                    &spec.name
+                );
+            }
+            common.disallow_open_after_us = Some(u64::MAX);
+            common.disallow_preempt_after_us = Some(u64::MAX);
+        } else {
+            if common.disallow_open_after_us.is_none() {
+                common.disallow_open_after_us = Some(*DFL_DISALLOW_OPEN_AFTER_US);
+            }
+
+            if common.disallow_preempt_after_us.is_none() {
+                common.disallow_preempt_after_us = Some(*DFL_DISALLOW_PREEMPT_AFTER_US);
+            }
+        }
+
+        if common.idle_smt.is_some() {
+            warn!("Layer {} has deprecated flag \"idle_smt\"", &spec.name);
+        }
     }
 
     debug!("specs={}", serde_json::to_string_pretty(&layer_config)?);

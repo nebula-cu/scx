@@ -1,7 +1,7 @@
 use anyhow::bail;
 use anyhow::Result;
 use libc;
-use log::info;
+use log::{info, warn};
 use scx_stats::prelude::*;
 use serde::Deserialize;
 use std::path::Path;
@@ -9,7 +9,7 @@ use std::thread::sleep;
 use std::time::Duration;
 
 pub fn monitor_stats<T>(
-    stats_args: &Vec<(String, String)>,
+    stats_args: &[(String, String)],
     intv: Duration,
     mut should_exit: impl FnMut() -> bool,
     mut output: impl FnMut(T) -> Result<()>,
@@ -30,7 +30,7 @@ where
             Err(e) => match e.downcast_ref::<std::io::Error>() {
                 Some(ioe) if RETRYABLE_ERRORS.contains(&ioe.kind()) => {
                     if retry_cnt == 1 {
-                        info!("Stats server not avaliable, retrying...");
+                        info!("Stats server not available, retrying...");
                     }
                     retry_cnt += 1;
                     sleep(Duration::from_secs(1));
@@ -42,7 +42,7 @@ where
         retry_cnt = 0;
 
         while !should_exit() {
-            let stats = match client.request::<T>("stats", stats_args.clone()) {
+            let stats = match client.request::<T>("stats", stats_args.to_owned()) {
                 Ok(v) => v,
                 Err(e) => match e.downcast_ref::<std::io::Error>() {
                     Some(ioe) => {
@@ -50,7 +50,11 @@ where
                         sleep(Duration::from_secs(1));
                         break;
                     }
-                    None => Err(e)?,
+                    None => {
+                        warn!("error on handling stats_server result {}", &e);
+                        sleep(Duration::from_secs(1));
+                        break;
+                    }
                 },
             };
             output(stats)?;
@@ -76,7 +80,7 @@ pub fn set_rlimit_infinity() {
 }
 
 pub fn read_file_usize(path: &Path) -> Result<usize> {
-    let val = match std::fs::read_to_string(&path) {
+    let val = match std::fs::read_to_string(path) {
         Ok(val) => val,
         Err(_) => {
             bail!("Failed to open or read file {:?}", path);

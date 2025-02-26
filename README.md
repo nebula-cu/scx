@@ -28,9 +28,8 @@ The following are a few highlights of this repository.
 
 [scx_rustland-terraria](https://github.com/sched-ext/scx/assets/1051723/42ec3bf2-9f1f-4403-80ab-bf5d66b7c2d5)
 
-While the kernel feature is not upstream yet, we believe sched_ext has a
-reasonable chance of landing upstream in the foreseeable future. Both Meta
-and Google are fully committed to sched_ext and Meta is in the process of
+sched_ext is supported by the upstream kernel starting from version 6.12. Both 
+Meta and Google are fully committed to sched_ext and Meta is in the process of
 mass production deployment. See (#kernel-feature-status) for more details.
 
 In all example shell commands, `$SCX` refers to the root of this repository.
@@ -176,7 +175,7 @@ in different directories. The system libbpf version needs to match the minimum
 libbpf version for scx.
  ```
 $ cd $SCX
-$ meson setup build --prefix ~ -D libbpf_a=/usr/lib64/libbpf.a libbpf_h=/usr/include/bpf/
+$ meson setup build --prefix ~ -D libbpf_a=/usr/lib64/libbpf.a -D libbpf_h=/usr/include/bpf/
 $ meson compile -C build
 $ meson install -C build
 ```
@@ -344,7 +343,7 @@ built and installed without cloning this repository as long as the necessary
 toolchains are available. Simply run:
 
 ```
-$ cargo install scx_rusty
+$ cargo install --locked scx_rusty
 ```
 
 and `scx_rusty` will be built and installed as `~/.cargo/bin/scx_rusty`.

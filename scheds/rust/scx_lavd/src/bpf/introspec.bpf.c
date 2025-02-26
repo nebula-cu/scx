@@ -35,7 +35,7 @@ int submit_task_ctx(struct task_struct *p, struct task_ctx *taskc, u32 cpu_id)
 
 	m->hdr.kind = LAVD_MSG_TASKC;
 	m->taskc_x.pid = p->pid;
-	memcpy(m->taskc_x.comm, p->comm, TASK_COMM_LEN);
+	__builtin_memcpy_inline(m->taskc_x.comm, p->comm, TASK_COMM_LEN);
 	m->taskc_x.static_prio = get_nice_prio(p);
 	m->taskc_x.cpu_util = cpuc->util / 10;
 	m->taskc_x.cpu_id = cpu_id;
@@ -48,10 +48,9 @@ int submit_task_ctx(struct task_struct *p, struct task_ctx *taskc, u32 cpu_id)
 	m->taskc_x.stat[1] = is_perf_cri(taskc, stat_cur) ? 'H' : 'I';
 	m->taskc_x.stat[2] = cpuc->big_core ? 'B' : 'T';
 	m->taskc_x.stat[3] = is_greedy(taskc) ? 'G' : 'E';
-	m->taskc_x.stat[4] = taskc->victim_cpu >= 0 ? 'P' : 'N';
-	m->taskc_x.stat[5] = '\0';
+	m->taskc_x.stat[4] = '\0';
 
-	memcpy(&m->taskc, taskc, sizeof(m->taskc));
+	__builtin_memcpy_inline(&m->taskc, taskc, sizeof(m->taskc));
 
 	bpf_ringbuf_submit(m, 0);
 
@@ -59,9 +58,10 @@ int submit_task_ctx(struct task_struct *p, struct task_ctx *taskc, u32 cpu_id)
 }
 
 static void proc_introspec_sched_n(struct task_struct *p,
-				   struct task_ctx *taskc, u32 cpu_id)
+				   struct task_ctx *taskc)
 {
 	u64 cur_nr, prev_nr;
+	u32 cpu_id;
 	int i;
 
 	/* do not introspect itself */
@@ -69,6 +69,7 @@ static void proc_introspec_sched_n(struct task_struct *p,
 		return;
 
 	/* introspec_arg is the number of schedules remaining */
+	cpu_id = bpf_get_smp_processor_id();
 	cur_nr = intrspc.arg;
 
 	/*
@@ -92,14 +93,11 @@ static void proc_introspec_sched_n(struct task_struct *p,
 }
 
 static void try_proc_introspec_cmd(struct task_struct *p,
-				   struct task_ctx *taskc, u32 cpu_id)
+				   struct task_ctx *taskc)
 {
-	if (LAVD_CPU_ID_HERE == cpu_id)
-		cpu_id = bpf_get_smp_processor_id();
-
 	switch(intrspc.cmd) {
 	case LAVD_CMD_SCHED_N:
-		proc_introspec_sched_n(p, taskc, cpu_id);
+		proc_introspec_sched_n(p, taskc);
 		break;
 	case LAVD_CMD_NOP:
 		/* do nothing */

@@ -11,7 +11,7 @@ pub mod bpf_intf;
 pub use bpf_intf::*;
 
 mod stats;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::ffi::c_int;
 use std::fs::File;
 use std::io::Read;
@@ -21,7 +21,6 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
 use clap::Parser;
@@ -31,10 +30,14 @@ use libbpf_rs::skel::Skel;
 use libbpf_rs::skel::SkelBuilder;
 use libbpf_rs::OpenObject;
 use libbpf_rs::ProgramInput;
-use log::info;
 use log::warn;
+use log::{debug, info};
 use scx_stats::prelude::*;
+use scx_utils::autopower::{fetch_power_profile, PowerProfile};
 use scx_utils::build_id;
+use scx_utils::compat;
+use scx_utils::import_enums;
+use scx_utils::scx_enums;
 use scx_utils::scx_ops_attach;
 use scx_utils::scx_ops_load;
 use scx_utils::scx_ops_open;
@@ -61,9 +64,9 @@ fn get_primary_cpus(mode: Powermode) -> std::io::Result<Vec<usize>> {
     let topo = Topology::new().unwrap();
 
     let cpus: Vec<usize> = topo
-        .cores()
-        .into_iter()
-        .flat_map(|core| core.cpus())
+        .all_cores
+        .values()
+        .flat_map(|core| &core.cpus)
         .filter_map(|(cpu_id, cpu)| match (&mode, &cpu.core_type) {
             // Performance mode: add all the Big CPUs (either Turbo or non-Turbo)
             (Powermode::Performance, CoreType::Big { .. }) |
@@ -138,20 +141,30 @@ struct Opts {
     #[clap(short = 'l', long, allow_hyphen_values = true, default_value = "20000")]
     slice_us_lag: i64,
 
-    /// With lowlatency enabled, instead of classifying tasks as interactive or non-interactive,
-    /// they all get a dynamic priority, which is adjusted in function of their average rate of
-    /// voluntary context switches.
+    /// Disable preemption.
     ///
-    /// This option guarantess less spikey behavior and it can be particularly useful in soft
-    /// real-time scenarios, such as audio processing, multimedia, etc.
-    #[clap(short = 'L', long, action = clap::ArgAction::SetTrue)]
-    lowlatency: bool,
+    /// Never allow tasks to preempt others before their assigned time slice expires. This can help
+    /// to increase system throughput over responsiveness.
+    #[clap(short = 'n', long, action = clap::ArgAction::SetTrue)]
+    no_preempt: bool,
 
-    /// Enable kthreads prioritization.
+    /// Enable per-CPU tasks prioritization.
     ///
-    /// Enabling this can improve system performance, but it may also introduce interactivity
-    /// issues or unfairness in scenarios with high kthread activity, such as heavy I/O or network
-    /// traffic.
+    /// This allows to prioritize per-CPU tasks that usually tend to be de-prioritized (since they
+    /// can't be migrated when their only usable CPU is busy). Enabling this option can introduce
+    /// unfairness and potentially trigger stalls, but it can improve performance of server-type
+    /// workloads (such as large parallel builds).
+    #[clap(short = 'p', long, action = clap::ArgAction::SetTrue)]
+    local_pcpu: bool,
+
+    /// Enable kthreads prioritization (EXPERIMENTAL).
+    ///
+    /// Enabling this can improve system performance, but it may also introduce noticeable
+    /// interactivity issues or unfairness in scenarios with high kthread activity, such as heavy
+    /// I/O or network traffic.
+    ///
+    /// Use it only when conducting specific experiments or if you have a clear understanding of
+    /// its implications.
     #[clap(short = 'k', long, action = clap::ArgAction::SetTrue)]
     local_kthreads: bool,
 
@@ -160,7 +173,7 @@ struct Opts {
     /// tasks may overflow to other available CPUs.
     ///
     /// Special values:
-    ///  - "auto" = automatically detect the CPUs based on the current energy profile
+    ///  - "auto" = automatically detect the CPUs based on the active power profile
     ///  - "performance" = automatically detect and prioritize the fastest CPUs
     ///  - "powersave" = automatically detect and prioritize the slowest CPUs
     ///  - "all" = all CPUs assigned to the primary domain
@@ -176,15 +189,18 @@ struct Opts {
     #[clap(long, action = clap::ArgAction::SetTrue)]
     disable_l3: bool,
 
-    /// Maximum threshold of voluntary context switches per second. This is used to classify interactive
-    /// tasks (0 = disable interactive tasks classification).
-    #[clap(short = 'c', long, default_value = "10")]
-    nvcsw_max_thresh: u64,
+    /// Enable CPU frequency control (only with schedutil governor).
+    ///
+    /// With this option enabled the CPU frequency will be automatically scaled based on the load.
+    #[clap(short = 'f', long, action = clap::ArgAction::SetTrue)]
+    cpufreq: bool,
 
-    /// Prevent starvation by making sure that at least one lower priority task is scheduled every
-    /// starvation_thresh_us (0 = disable starvation prevention).
-    #[clap(short = 't', long, default_value = "1000")]
-    starvation_thresh_us: u64,
+    /// [DEPRECATED] Maximum threshold of voluntary context switches per second. This is used to
+    /// classify interactive.
+    ///
+    /// tasks (0 = disable interactive tasks classification).
+    #[clap(short = 'c', long, default_value = "10", hide = true)]
+    nvcsw_max_thresh: u64,
 
     /// Enable stats monitoring with the specified interval.
     #[clap(long)]
@@ -226,8 +242,9 @@ struct Scheduler<'a> {
     skel: BpfSkel<'a>,
     struct_ops: Option<libbpf_rs::Link>,
     opts: &'a Opts,
-    energy_profile: String,
+    power_profile: PowerProfile,
     stats_server: StatsServer<(), Metrics>,
+    user_restart: bool,
 }
 
 impl<'a> Scheduler<'a> {
@@ -240,12 +257,12 @@ impl<'a> Scheduler<'a> {
         // Check host topology to determine if we need to enable SMT capabilities.
         let smt_enabled = match is_smt_active() {
             Ok(value) => value == 1,
-            Err(e) => bail!("Failed to read SMT status: {}", e),
+            Err(_) => false,
         };
         info!(
             "{} {} {}",
             SCHEDULER_NAME,
-            *build_id::SCX_FULL_VERSION,
+            build_id::full_version(env!("CARGO_PKG_VERSION")),
             if smt_enabled { "SMT on" } else { "SMT off" }
         );
 
@@ -259,13 +276,15 @@ impl<'a> Scheduler<'a> {
         // Override default BPF scheduling parameters.
         skel.maps.rodata_data.debug = opts.debug;
         skel.maps.rodata_data.smt_enabled = smt_enabled;
-        skel.maps.rodata_data.lowlatency = opts.lowlatency;
+        skel.maps.rodata_data.local_pcpu = opts.local_pcpu;
         skel.maps.rodata_data.local_kthreads = opts.local_kthreads;
+        skel.maps.rodata_data.no_preempt = opts.no_preempt;
         skel.maps.rodata_data.slice_max = opts.slice_us * 1000;
         skel.maps.rodata_data.slice_min = opts.slice_us_min * 1000;
         skel.maps.rodata_data.slice_lag = opts.slice_us_lag * 1000;
-        skel.maps.rodata_data.starvation_thresh_ns = opts.starvation_thresh_us * 1000;
-        skel.maps.rodata_data.nvcsw_max_thresh = opts.nvcsw_max_thresh;
+
+        // Disable automatic dispatch of migration-disabled tasks.
+        skel.struct_ops.bpfland_ops_mut().flags |= *compat::SCX_OPS_ENQ_MIGRATION_DISABLED;
 
         // Load the BPF program for validation.
         let mut skel = scx_ops_load!(skel, bpfland_ops, uei)?;
@@ -274,13 +293,11 @@ impl<'a> Scheduler<'a> {
         let topo = Topology::new().unwrap();
 
         // Initialize the primary scheduling domain and the preferred domain.
-        let energy_profile = Self::read_energy_profile();
-        if let Err(err) = Self::init_energy_domain(&mut skel, &opts.primary_domain, &energy_profile)
-        {
+        let power_profile = fetch_power_profile(false);
+        if let Err(err) = Self::init_energy_domain(&mut skel, &opts.primary_domain, power_profile) {
             warn!("failed to initialize primary domain: error {}", err);
         }
-        if let Err(err) = Self::init_cpufreq_perf(&mut skel, &opts.primary_domain, &energy_profile)
-        {
+        if let Err(err) = Self::init_cpufreq_perf(&mut skel, &opts.primary_domain, opts.cpufreq) {
             warn!(
                 "failed to initialize cpufreq performance level: error {}",
                 err
@@ -304,8 +321,9 @@ impl<'a> Scheduler<'a> {
             skel,
             struct_ops,
             opts,
-            energy_profile,
+            power_profile,
             stats_server,
+            user_restart: false,
         })
     }
 
@@ -331,57 +349,31 @@ impl<'a> Scheduler<'a> {
         Ok(())
     }
 
-    fn read_energy_profile() -> String {
-        let energy_pref_path =
-            "/sys/devices/system/cpu/cpufreq/policy0/energy_performance_preference";
-        let scaling_governor_path = "/sys/devices/system/cpu/cpufreq/policy0/scaling_governor";
-
-        let res = File::open(energy_pref_path)
-            .and_then(|mut file| {
-                let mut contents = String::new();
-                file.read_to_string(&mut contents)?;
-                Ok(contents.trim().to_string())
-            })
-            .or_else(|_| {
-                File::open(scaling_governor_path)
-                    .and_then(|mut file| {
-                        let mut contents = String::new();
-                        file.read_to_string(&mut contents)?;
-                        Ok(contents.trim().to_string())
-                    })
-                    .or_else(|_| Ok("none".to_string()))
-            });
-
-        res.unwrap_or_else(|_: String| "none".to_string())
-    }
-
     fn epp_to_cpumask(profile: Powermode) -> Result<Cpumask> {
-        let mut cpus = get_primary_cpus(profile).unwrap_or(Vec::new());
+        let mut cpus = get_primary_cpus(profile).unwrap_or_default();
         if cpus.is_empty() {
-            cpus = get_primary_cpus(Powermode::Any).unwrap_or(Vec::new());
+            cpus = get_primary_cpus(Powermode::Any).unwrap_or_default();
         }
         Cpumask::from_str(&cpus_to_cpumask(&cpus))
     }
 
     fn init_energy_domain(
         skel: &mut BpfSkel<'_>,
-        primary_domain: &String,
-        energy_profile: &String,
+        primary_domain: &str,
+        power_profile: PowerProfile,
     ) -> Result<()> {
-        let domain = match primary_domain.as_str() {
+        let domain = match primary_domain {
             "powersave" => Self::epp_to_cpumask(Powermode::Powersave)?,
             "performance" => Self::epp_to_cpumask(Powermode::Performance)?,
-            "auto" => match energy_profile.as_str() {
-                "power" | "balance_power" | "powersave" => {
-                    Self::epp_to_cpumask(Powermode::Powersave)?
-                }
-                "balance_performance" | "performance" => {
+            "auto" => match power_profile {
+                PowerProfile::Powersave => Self::epp_to_cpumask(Powermode::Powersave)?,
+                PowerProfile::Performance | PowerProfile::Balanced => {
                     Self::epp_to_cpumask(Powermode::Performance)?
                 }
-                &_ => Self::epp_to_cpumask(Powermode::Any)?,
+                PowerProfile::Unknown => Self::epp_to_cpumask(Powermode::Any)?,
             },
             "all" => Self::epp_to_cpumask(Powermode::Any)?,
-            &_ => Cpumask::from_str(&primary_domain)?,
+            &_ => Cpumask::from_str(primary_domain)?,
         };
 
         info!("primary CPU domain = 0x{:x}", domain);
@@ -406,17 +398,14 @@ impl<'a> Scheduler<'a> {
     fn init_cpufreq_perf(
         skel: &mut BpfSkel<'_>,
         primary_domain: &String,
-        energy_profile: &String,
+        auto: bool,
     ) -> Result<()> {
+        // If we are using the powersave profile always scale the CPU frequency to the minimum,
+        // otherwise use the maximum, unless automatic frequency scaling is enabled.
         let perf_lvl: i64 = match primary_domain.as_str() {
-            "auto" => match energy_profile.as_str() {
-                "performance" => 1024,
-                "power" | "powersave" => 0,
-                &_ => -1,
-            },
-            "performance" => 1024,
             "powersave" => 0,
-            _ => -1,
+            _ if auto => -1,
+            _ => 1024,
         };
         info!(
             "cpufreq performance level: {}",
@@ -432,30 +421,26 @@ impl<'a> Scheduler<'a> {
         Ok(())
     }
 
-    fn refresh_sched_domain(&mut self) {
-        if self.energy_profile != "none" {
-            let energy_profile = Self::read_energy_profile();
-            if energy_profile != self.energy_profile {
-                self.energy_profile = energy_profile.clone();
+    fn refresh_sched_domain(&mut self) -> bool {
+        if self.power_profile != PowerProfile::Unknown {
+            let power_profile = fetch_power_profile(false);
+            if power_profile != self.power_profile {
+                self.power_profile = power_profile;
 
                 if self.opts.primary_domain == "auto" {
-                    if let Err(err) = Self::init_energy_domain(
-                        &mut self.skel,
-                        &self.opts.primary_domain,
-                        &energy_profile,
-                    ) {
-                        warn!("failed to refresh primary domain: error {}", err);
-                    }
+                    return true;
                 }
                 if let Err(err) = Self::init_cpufreq_perf(
                     &mut self.skel,
                     &self.opts.primary_domain,
-                    &energy_profile,
+                    self.opts.cpufreq,
                 ) {
                     warn!("failed to refresh cpufreq performance level: error {}", err);
                 }
             }
         }
+
+        false
     }
 
     fn enable_sibling_cpu(
@@ -494,18 +479,15 @@ impl<'a> Scheduler<'a> {
         enable_sibling_cpu_fn: &dyn Fn(&mut BpfSkel<'_>, usize, usize, usize) -> Result<(), u32>,
     ) -> Result<(), std::io::Error> {
         // Determine the list of CPU IDs associated to each cache node.
-        let mut cache_id_map: HashMap<usize, Vec<usize>> = HashMap::new();
-        for core in topo.cores().into_iter() {
-            for (cpu_id, cpu) in core.cpus() {
+        let mut cache_id_map: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+        for core in topo.all_cores.values() {
+            for (cpu_id, cpu) in &core.cpus {
                 let cache_id = match cache_lvl {
-                    2 => cpu.l2_id(),
-                    3 => cpu.l3_id(),
+                    2 => cpu.l2_id,
+                    3 => cpu.llc_id,
                     _ => panic!("invalid cache level {}", cache_lvl),
                 };
-                cache_id_map
-                    .entry(cache_id)
-                    .or_insert_with(Vec::new)
-                    .push(*cpu_id);
+                cache_id_map.entry(cache_id).or_default().push(*cpu_id);
             }
         }
 
@@ -555,13 +537,8 @@ impl<'a> Scheduler<'a> {
         Metrics {
             nr_running: self.skel.maps.bss_data.nr_running,
             nr_cpus: self.skel.maps.bss_data.nr_online_cpus,
-            nr_interactive: self.skel.maps.bss_data.nr_interactive,
-            nr_prio_waiting: self.skel.maps.bss_data.nr_prio_waiting,
-            nr_shared_waiting: self.skel.maps.bss_data.nr_shared_waiting,
-            nvcsw_avg_thresh: self.skel.maps.bss_data.nvcsw_avg_thresh,
             nr_kthread_dispatches: self.skel.maps.bss_data.nr_kthread_dispatches,
             nr_direct_dispatches: self.skel.maps.bss_data.nr_direct_dispatches,
-            nr_prio_dispatches: self.skel.maps.bss_data.nr_prio_dispatches,
             nr_shared_dispatches: self.skel.maps.bss_data.nr_shared_dispatches,
         }
     }
@@ -573,7 +550,10 @@ impl<'a> Scheduler<'a> {
     fn run(&mut self, shutdown: Arc<AtomicBool>) -> Result<UserExitInfo> {
         let (res_ch, req_ch) = self.stats_server.channels();
         while !shutdown.load(Ordering::Relaxed) && !self.exited() {
-            self.refresh_sched_domain();
+            if self.refresh_sched_domain() {
+                self.user_restart = true;
+                break;
+            }
             match req_ch.recv_timeout(Duration::from_secs(1)) {
                 Ok(()) => res_ch.send(self.get_metrics())?,
                 Err(RecvTimeoutError::Timeout) => {}
@@ -586,7 +566,7 @@ impl<'a> Scheduler<'a> {
     }
 }
 
-impl<'a> Drop for Scheduler<'a> {
+impl Drop for Scheduler<'_> {
     fn drop(&mut self) {
         info!("Unregister {} scheduler", SCHEDULER_NAME);
     }
@@ -596,7 +576,11 @@ fn main() -> Result<()> {
     let opts = Opts::parse();
 
     if opts.version {
-        println!("{} {}", SCHEDULER_NAME, *build_id::SCX_FULL_VERSION);
+        println!(
+            "{} {}",
+            SCHEDULER_NAME,
+            build_id::full_version(env!("CARGO_PKG_VERSION"))
+        );
         return Ok(());
     }
 
@@ -629,7 +613,17 @@ fn main() -> Result<()> {
     if let Some(intv) = opts.monitor.or(opts.stats) {
         let shutdown_copy = shutdown.clone();
         let jh = std::thread::spawn(move || {
-            stats::monitor(Duration::from_secs_f64(intv), shutdown_copy).unwrap()
+            match stats::monitor(Duration::from_secs_f64(intv), shutdown_copy) {
+                Ok(_) => {
+                    debug!("stats monitor thread finished successfully")
+                }
+                Err(error_object) => {
+                    warn!(
+                        "stats monitor thread finished because of an error {}",
+                        error_object
+                    )
+                }
+            }
         });
         if opts.monitor.is_some() {
             let _ = jh.join();
@@ -641,6 +635,9 @@ fn main() -> Result<()> {
     loop {
         let mut sched = Scheduler::init(&opts, &mut open_object)?;
         if !sched.run(shutdown.clone())?.should_restart() {
+            if sched.user_restart {
+                continue;
+            }
             break;
         }
     }

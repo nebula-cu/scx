@@ -19,20 +19,10 @@ pub struct Metrics {
     pub nr_running: u64,
     #[stat(desc = "Number of online CPUs")]
     pub nr_cpus: u64,
-    #[stat(desc = "Number of running interactive tasks")]
-    pub nr_interactive: u64,
-    #[stat(desc = "Average amount of regular tasks waiting to be dispatched")]
-    pub nr_shared_waiting: u64,
-    #[stat(desc = "Average amount of interactive tasks waiting to be dispatched")]
-    pub nr_prio_waiting: u64,
-    #[stat(desc = "Average of voluntary context switches")]
-    pub nvcsw_avg_thresh: u64,
     #[stat(desc = "Number of kthread direct dispatches")]
     pub nr_kthread_dispatches: u64,
     #[stat(desc = "Number of task direct dispatches")]
     pub nr_direct_dispatches: u64,
-    #[stat(desc = "Number of interactive task dispatches")]
-    pub nr_prio_dispatches: u64,
     #[stat(desc = "Number of regular task dispatches")]
     pub nr_shared_dispatches: u64,
 }
@@ -41,17 +31,12 @@ impl Metrics {
     fn format<W: Write>(&self, w: &mut W) -> Result<()> {
         writeln!(
             w,
-            "[{}] tasks -> r: {:>2}/{:<2} i: {:<2} pw: {:<4} w: {:<4} | nvcsw: {:<4} | dispatch -> k: {:<5} d: {:<5} p: {:<5} s: {:<5}",
+            "[{}] tasks -> r: {:>2}/{:<2} | dispatch -> k: {:<5} d: {:<5} s: {:<5}",
             crate::SCHEDULER_NAME,
             self.nr_running,
             self.nr_cpus,
-            self.nr_interactive,
-            self.nr_prio_waiting,
-            self.nr_shared_waiting,
-            self.nvcsw_avg_thresh,
             self.nr_kthread_dispatches,
             self.nr_direct_dispatches,
-            self.nr_prio_dispatches,
             self.nr_shared_dispatches
         )?;
         Ok(())
@@ -61,7 +46,6 @@ impl Metrics {
         Self {
             nr_kthread_dispatches: self.nr_kthread_dispatches - rhs.nr_kthread_dispatches,
             nr_direct_dispatches: self.nr_direct_dispatches - rhs.nr_direct_dispatches,
-            nr_prio_dispatches: self.nr_prio_dispatches - rhs.nr_prio_dispatches,
             nr_shared_dispatches: self.nr_shared_dispatches - rhs.nr_shared_dispatches,
             ..self.clone()
         }
@@ -91,7 +75,7 @@ pub fn server_data() -> StatsServerData<(), Metrics> {
 
 pub fn monitor(intv: Duration, shutdown: Arc<AtomicBool>) -> Result<()> {
     scx_utils::monitor_stats::<Metrics>(
-        &vec![],
+        &[],
         intv,
         || shutdown.load(Ordering::Relaxed),
         |metrics| metrics.format(&mut std::io::stdout()),

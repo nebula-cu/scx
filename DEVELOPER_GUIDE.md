@@ -34,13 +34,18 @@ common crate for calculating weights between scheduling domains. See the
 ## Rust
 We use `cargo fmt` to ensure consistency in our Rust code. This runs on PRs in
 the CI and will fail with a patch if your code doesn't match. We currently need
-a nightly version of Rust to format so have pinned this for consistency. To run
-locally (with rustup) run:
+a nightly version of Rust to format so have pinned this for consistency. If you
+have rustup installed this will use the version in `rust-toolchain.toml`.
 
-    $ rustup install nightly-2024-09-10
-    $ cargo +nightly-2024-09-10 fmt
+    $ cargo fmt
 
 ## Useful Tools
+
+## [scxtop](https://github.com/sched-ext/scx/blob/main/tools/scxtop/README.md)
+`scxtop` is a top like tool that collects and aggregates various perf and
+sched_ext events. See the
+[README](https://github.com/sched-ext/scx/blob/main/tools/scxtop/README.md) for
+more details.
 
 ### [Perfetto](https://perfetto.dev/)
 [Perfetto](https://perfetto.dev/) is a profiling and trace visualization
@@ -162,6 +167,12 @@ FUNCTION CALL TRACE                 RESULT     DURATION
 language for BPF. When working with sched_ext `bpftrace` programs can be used
 for understanding scheduler run queue latency as other scheduler internals. See
 the `scripts` dir for examples.
+
+### `bpftop`
+[`bpftop`](https://github.com/Netflix/bpftop) is a top/htop like program that
+provides an overview of bpf program usage. It shows period and total average
+runtime for each eBPF program, which is useful in understanding each scheduler
+subprogram.
 
 ### `stress-ng`
 For generating synthetic load on a system

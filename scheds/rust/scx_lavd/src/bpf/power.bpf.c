@@ -19,6 +19,7 @@ const volatile u16	cpu_order_performance[LAVD_CPU_ID_MAX]; /* CPU preference ord
 const volatile u16	cpu_order_powersave[LAVD_CPU_ID_MAX]; /* CPU preference order for powersave mode */
 const volatile u16	__cpu_capacity_hint[LAVD_CPU_ID_MAX]; /* CPU capacity based on 1000 */
 struct cpdom_ctx	cpdom_ctxs[LAVD_CPDOM_MAX_NR]; /* contexts for compute domains */
+static int		nr_cpdoms; /* number of compute domains */
 
 
 /*
@@ -39,6 +40,16 @@ volatile u64		last_power_mode_clk;
 volatile u64		performance_mode_ns;
 volatile u64		balanced_mode_ns;
 volatile u64		powersave_mode_ns;
+
+static bool is_perf_cri(struct task_ctx *taskc, struct sys_stat *stat_cur)
+{
+	if (!have_little_core)
+		return true;
+
+	if (READ_ONCE(taskc->on_big) && READ_ONCE(taskc->on_little))
+		return taskc->perf_cri >= stat_cur->thr_perf_cri;
+	return READ_ONCE(taskc->on_big);
+}
 
 static u64 calc_nr_active_cpus(struct sys_stat *stat_cur)
 {
@@ -185,13 +196,13 @@ unlock_out:
 
 static void update_power_mode_time(void)
 {
-	u64 now = bpf_ktime_get_ns();
+	u64 now = scx_bpf_now();
 	u64 delta;
 
 	if (last_power_mode_clk == 0)
 		last_power_mode_clk = now;
 
-	delta = now - last_power_mode_clk;
+	delta = time_delta(now, last_power_mode_clk);
 	last_power_mode_clk = now;
 
 	switch (power_mode) {
@@ -228,7 +239,7 @@ static int do_set_power_profile(s32 pm, int util)
 	switch (pm) {
 	case LAVD_PM_PERFORMANCE:
 		no_core_compaction = true;
-		no_freq_scaling = true;
+		no_freq_scaling = false;
 		no_prefer_turbo_core = false;
 		is_powersave_mode = false;
 
@@ -405,10 +416,14 @@ static int reinit_active_cpumask_for_performance(void)
 			goto unlock_out;
 		}
 
-		if (cpuc->big_core)
+		if (cpuc->big_core) {
 			bpf_cpumask_set_cpu(cpu, active);
-		else
+			bpf_cpumask_clear_cpu(cpu, ovrflw);
+		}
+		else {
 			bpf_cpumask_set_cpu(cpu, ovrflw);
+			bpf_cpumask_clear_cpu(cpu, active);
+		}
 	}
 
 unlock_out:

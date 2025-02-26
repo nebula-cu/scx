@@ -37,6 +37,8 @@ use libc::{pthread_self, pthread_setschedparam, sched_param};
 use libc::timespec;
 
 use scx_utils::compat;
+use scx_utils::import_enums;
+use scx_utils::scx_enums;
 use scx_utils::scx_ops_attach;
 use scx_utils::scx_ops_load;
 use scx_utils::scx_ops_open;
@@ -232,6 +234,7 @@ impl<'cb> BpfScheduler<'cb> {
         //
         // Use of a `str` whose contents are not valid UTF-8 is undefined behavior.
         fn callback(data: &[u8]) -> i32 {
+            #[allow(static_mut_refs)]
             unsafe {
                 // SAFETY: copying from the BPF ring buffer to BUF is safe, since the size of BUF
                 // is exactly the size of QueuedTask and the callback operates in chunks of
@@ -335,19 +338,21 @@ impl<'cb> BpfScheduler<'cb> {
         Ok(())
     }
 
-    fn init_cache_domains(
+    fn init_cache_domains<SiblingCpuFn>(
         skel: &mut BpfSkel<'_>,
         topo: &Topology,
         cache_lvl: usize,
-        enable_sibling_cpu_fn: &dyn Fn(&mut BpfSkel<'_>, usize, usize, usize) -> Result<(), u32>,
-    ) -> Result<(), std::io::Error> {
+        enable_sibling_cpu_fn: &SiblingCpuFn,
+    ) -> Result<(), std::io::Error>
+        where SiblingCpuFn: Fn(&mut BpfSkel<'_>, usize, usize, usize) -> Result<(), u32>
+    {
         // Determine the list of CPU IDs associated to each cache node.
         let mut cache_id_map: HashMap<usize, Vec<usize>> = HashMap::new();
-        for core in topo.cores().into_iter() {
-            for (cpu_id, cpu) in core.cpus() {
+        for core in topo.all_cores.values() {
+            for (cpu_id, cpu) in &core.cpus {
                 let cache_id = match cache_lvl {
-                    2 => cpu.l2_id(),
-                    3 => cpu.l3_id(),
+                    2 => cpu.l2_id,
+                    3 => cpu.l3_id,
                     _ => panic!("invalid cache level {}", cache_lvl),
                 };
                 cache_id_map
@@ -506,6 +511,7 @@ impl<'cb> BpfScheduler<'cb> {
     }
 
     // Receive a task to be scheduled from the BPF dispatcher.
+    #[allow(static_mut_refs)]
     pub fn dequeue_task(&mut self) -> Result<Option<QueuedTask>, i32> {
         match self.queued.consume_raw() {
             0 => {
@@ -579,7 +585,7 @@ impl<'cb> BpfScheduler<'cb> {
 }
 
 // Disconnect the low-level BPF scheduler.
-impl<'a> Drop for BpfScheduler<'a> {
+impl Drop for BpfScheduler<'_> {
     fn drop(&mut self) {
         if let Some(struct_ops) = self.struct_ops.take() {
             drop(struct_ops);

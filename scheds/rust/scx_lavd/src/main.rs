@@ -49,7 +49,10 @@ use log::info;
 use log::warn;
 use plain::Plain;
 use scx_stats::prelude::*;
+use scx_utils::autopower::{fetch_power_profile, PowerProfile};
 use scx_utils::build_id;
+use scx_utils::import_enums;
+use scx_utils::scx_enums;
 use scx_utils::scx_ops_attach;
 use scx_utils::scx_ops_load;
 use scx_utils::scx_ops_open;
@@ -77,7 +80,7 @@ struct Opts {
     #[clap(long = "autopilot", action = clap::ArgAction::SetTrue)]
     autopilot: bool,
 
-    /// Automatically decide the scheduler's power mode based on the system's energy profile.
+    /// Automatically decide the scheduler's power mode based on the system's active power profile.
     #[clap(long = "autopower", action = clap::ArgAction::SetTrue)]
     autopower: bool,
 
@@ -92,6 +95,14 @@ struct Opts {
     /// Run in balanced mode aiming for sweetspot between power and performance (default).
     #[clap(long = "balanced", action = clap::ArgAction::SetTrue)]
     balanced: bool,
+
+    /// Maximum scheduling slice duration in microseconds.
+    #[clap(long = "slice-max-us", default_value = "5000")]
+    slice_max_us: u64,
+
+    /// Minimum scheduling slice duration in microseconds.
+    #[clap(long = "slice-min-us", default_value = "300")]
+    slice_min_us: u64,
 
     /// Disable core compaction and schedule tasks across all online CPUs. Core compaction attempts
     /// to keep idle CPUs idle in favor of scheduling tasks on CPUs that are already
@@ -151,7 +162,7 @@ struct Opts {
 
 impl Opts {
     fn nothing_specified(&self) -> bool {
-        return self.autopilot == false
+        self.autopilot == false
             && self.autopower == false
             && self.performance == false
             && self.powersave == false
@@ -162,7 +173,7 @@ impl Opts {
             && self.no_prefer_turbo_core == false
             && self.no_freq_scaling == false
             && self.monitor == None
-            && self.monitor_sched_samples == None;
+            && self.monitor_sched_samples == None
     }
 
     fn proc(&mut self) -> Option<&mut Self> {
@@ -211,7 +222,7 @@ impl introspec {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct CpuFlatId {
     node_id: usize,
     llc_pos: usize,
@@ -219,6 +230,10 @@ struct CpuFlatId {
     core_pos: usize,
     cpu_pos: usize,
     cpu_id: usize,
+    core_id: usize,
+    l2_id: usize,
+    l3_id: usize,
+    sharing_lvl: usize,
     cpu_cap: usize,
 }
 
@@ -294,28 +309,33 @@ impl FlatTopology {
     ) -> Option<(Vec<CpuFlatId>, usize)> {
         let topo = Topology::new().expect("Failed to build host topology");
         let mut cpu_fids = Vec::new();
+        debug!("{:#?}", topo);
 
         // Build a vector of cpu flat ids.
         let mut base_freq = 0;
         let mut avg_freq = 0;
-        for (node_id, node) in topo.nodes().iter().enumerate() {
-            for (llc_pos, (_llc_id, llc)) in node.llcs().iter().enumerate() {
-                for (core_pos, (_core_id, core)) in llc.cores().iter().enumerate() {
-                    for (cpu_pos, (cpu_id, cpu)) in core.cpus().iter().enumerate() {
+        for (&node_id, node) in topo.nodes.iter() {
+            for (llc_pos, (_llc_id, llc)) in node.llcs.iter().enumerate() {
+                for (core_pos, (core_id, core)) in llc.cores.iter().enumerate() {
+                    for (cpu_pos, (cpu_id, cpu)) in core.cpus.iter().enumerate() {
                         let cpu_fid = CpuFlatId {
                             node_id,
                             llc_pos,
-                            max_freq: cpu.max_freq(),
+                            max_freq: cpu.max_freq,
                             core_pos,
                             cpu_pos,
                             cpu_id: *cpu_id,
+                            core_id: *core_id,
+                            l2_id: cpu.l2_id,
+                            l3_id: cpu.l3_id,
+                            sharing_lvl: 0,
                             cpu_cap: 0,
                         };
-                        cpu_fids.push(cpu_fid);
-                        if base_freq < cpu.max_freq() {
-                            base_freq = cpu.max_freq();
+                        cpu_fids.push(RefCell::new(cpu_fid));
+                        if base_freq < cpu.max_freq {
+                            base_freq = cpu.max_freq;
                         }
-                        avg_freq += cpu.max_freq();
+                        avg_freq += cpu.max_freq;
                     }
                 }
             }
@@ -325,60 +345,94 @@ impl FlatTopology {
         // Initialize cpu capacity
         if base_freq > 0 {
             for cpu_fid in cpu_fids.iter_mut() {
+                let mut cpu_fid = cpu_fid.borrow_mut();
                 cpu_fid.cpu_cap = ((cpu_fid.max_freq * 1024) / base_freq) as usize;
             }
         } else {
             // Unfortunately, the frequency information in sysfs seems not
             // always correct in some distributions.
             for cpu_fid in cpu_fids.iter_mut() {
-                cpu_fid.cpu_cap = 1024 as usize;
+                cpu_fid.borrow_mut().cpu_cap = 1024 as usize;
             }
-            warn!("System does not provide proper CPU frequency infomation.");
+            warn!("System does not provide proper CPU frequency information.");
         }
+
+        // Initialize cpu's hardware resource sharing level
+        for (a_id, cpu_fid_a) in cpu_fids.iter().enumerate() {
+            for (b_id, cpu_fid_b) in cpu_fids.iter().enumerate() {
+                if a_id == b_id {
+                    continue;
+                }
+
+                let mut a = cpu_fid_a.borrow_mut();
+                let b = cpu_fid_b.borrow();
+
+                if a.core_id == b.core_id {
+                    a.sharing_lvl += 1;
+                }
+                if a.l2_id == b.l2_id {
+                    a.sharing_lvl += 1;
+                }
+                if a.l3_id == b.l3_id {
+                    a.sharing_lvl += 1;
+                }
+            }
+        }
+
+        // Convert a vector of RefCell to a vector of plain cpu_fids
+        let mut cpu_fids2 = Vec::new();
+        for cpu_fid in cpu_fids.iter() {
+            cpu_fids2.push(cpu_fid.borrow().clone());
+        }
+        let mut cpu_fids = cpu_fids2;
 
         // Sort the cpu_fids
         match (prefer_smt_core, prefer_little_core) {
             (true, false) => {
-                // Sort the cpu_fids by node, llc, ^max_freq, core, and cpu order
+                // Sort the cpu_fids by node, llc, ^max_freq, ^sharing_lvl, core, and cpu order
                 cpu_fids.sort_by(|a, b| {
                     a.node_id
                         .cmp(&b.node_id)
                         .then_with(|| a.llc_pos.cmp(&b.llc_pos))
                         .then_with(|| b.max_freq.cmp(&a.max_freq))
+                        .then_with(|| b.sharing_lvl.cmp(&a.sharing_lvl))
                         .then_with(|| a.core_pos.cmp(&b.core_pos))
                         .then_with(|| a.cpu_pos.cmp(&b.cpu_pos))
                 });
             }
             (true, true) => {
-                // Sort the cpu_fids by node, llc, max_freq, core, and cpu order
+                // Sort the cpu_fids by node, llc, max_freq, ^sharing_lvl, core, and cpu order
                 cpu_fids.sort_by(|a, b| {
                     a.node_id
                         .cmp(&b.node_id)
                         .then_with(|| a.llc_pos.cmp(&b.llc_pos))
                         .then_with(|| a.max_freq.cmp(&b.max_freq))
+                        .then_with(|| b.sharing_lvl.cmp(&a.sharing_lvl))
                         .then_with(|| a.core_pos.cmp(&b.core_pos))
                         .then_with(|| a.cpu_pos.cmp(&b.cpu_pos))
                 });
             }
             (false, false) => {
-                // Sort the cpu_fids by cpu, node, llc, ^max_freq, and core order
+                // Sort the cpu_fids by cpu, node, llc, ^max_freq, sharing_lvl, and core order
                 cpu_fids.sort_by(|a, b| {
                     a.cpu_pos
                         .cmp(&b.cpu_pos)
                         .then_with(|| a.node_id.cmp(&b.node_id))
                         .then_with(|| a.llc_pos.cmp(&b.llc_pos))
                         .then_with(|| b.max_freq.cmp(&a.max_freq))
+                        .then_with(|| a.sharing_lvl.cmp(&b.sharing_lvl))
                         .then_with(|| a.core_pos.cmp(&b.core_pos))
                 });
             }
             (false, true) => {
-                // Sort the cpu_fids by cpu, node, llc, max_freq, and core order
+                // Sort the cpu_fids by cpu, node, llc, max_freq, sharing_lvl, and core order
                 cpu_fids.sort_by(|a, b| {
                     a.cpu_pos
                         .cmp(&b.cpu_pos)
                         .then_with(|| a.node_id.cmp(&b.node_id))
                         .then_with(|| a.llc_pos.cmp(&b.llc_pos))
                         .then_with(|| a.max_freq.cmp(&b.max_freq))
+                        .then_with(|| a.sharing_lvl.cmp(&b.sharing_lvl))
                         .then_with(|| a.core_pos.cmp(&b.core_pos))
                 });
             }
@@ -549,6 +603,7 @@ impl<'a> Scheduler<'a> {
         for (k, v) in topo.cpdom_map.iter() {
             skel.maps.bss_data.cpdom_ctxs[v.cpdom_id].id = v.cpdom_id as u64;
             skel.maps.bss_data.cpdom_ctxs[v.cpdom_id].alt_id = v.cpdom_alt_id.get() as u64;
+            skel.maps.bss_data.cpdom_ctxs[v.cpdom_id].node_id = k.node_id as u8;
             skel.maps.bss_data.cpdom_ctxs[v.cpdom_id].is_big = k.is_big as u8;
             skel.maps.bss_data.cpdom_ctxs[v.cpdom_id].is_active = 1;
             for cpu_id in v.cpu_ids.iter() {
@@ -590,6 +645,8 @@ impl<'a> Scheduler<'a> {
         };
         skel.maps.rodata_data.is_autopilot_on = opts.autopilot;
         skel.maps.rodata_data.verbose = opts.verbose;
+        skel.maps.rodata_data.slice_max_ns = opts.slice_max_us * 1000;
+        skel.maps.rodata_data.slice_min_ns = opts.slice_min_us * 1000;
     }
 
     fn get_msg_seq_id() -> u64 {
@@ -616,7 +673,7 @@ impl<'a> Scheduler<'a> {
         let c_tx_cm_str: &CStr = unsafe { CStr::from_ptr(c_tx_cm) };
         let tx_comm: &str = c_tx_cm_str.to_str().unwrap();
 
-        let c_tx_st: *const c_char = (&tx.stat as *const [c_char; 6]) as *const c_char;
+        let c_tx_st: *const c_char = (&tx.stat as *const [c_char; 5]) as *const c_char;
         let c_tx_st_str: &CStr = unsafe { CStr::from_ptr(c_tx_st) };
         let tx_stat: &str = c_tx_st_str.to_str().unwrap();
 
@@ -626,10 +683,7 @@ impl<'a> Scheduler<'a> {
             comm: tx_comm.into(),
             stat: tx_stat.into(),
             cpu_id: tx.cpu_id,
-            victim_cpu: tc.victim_cpu,
-            vdeadline_delta_ns: tc.vdeadline_delta_ns,
             slice_ns: tc.slice_ns,
-            greedy_ratio: tc.greedy_ratio,
             lat_cri: tc.lat_cri,
             avg_lat_cri: tx.avg_lat_cri,
             static_prio: tx.static_prio,
@@ -664,18 +718,10 @@ impl<'a> Scheduler<'a> {
 
     fn get_power_mode(power_mode: i32) -> &'static str {
         match power_mode as u32 {
-            LAVD_PM_PERFORMANCE => {
-                return &"performance";
-            }
-            LAVD_PM_BALANCED => {
-                return &"balanced";
-            }
-            LAVD_PM_POWERSAVE => {
-                return &"powersave";
-            }
-            _ => {
-                return &"unknown";
-            }
+            LAVD_PM_PERFORMANCE => "performance",
+            LAVD_PM_BALANCED => "balanced",
+            LAVD_PM_POWERSAVE => "powersave",
+            _ => "unknown",
         }
     }
 
@@ -696,16 +742,13 @@ impl<'a> Scheduler<'a> {
                 let st = bss_data.__sys_stats[0];
 
                 let mseq = self.mseq_id;
-                let avg_svc_time = st.avg_svc_time;
                 let nr_queued_task = st.nr_queued_task;
                 let nr_active = st.nr_active;
                 let nr_sched = st.nr_sched;
-                let pc_lhp = Self::get_pc(st.nr_lhp, nr_sched);
-                let pc_migration = Self::get_pc(st.nr_migration, nr_sched);
-                let pc_preemption = Self::get_pc(st.nr_preemption, nr_sched);
-                let pc_greedy = Self::get_pc(st.nr_greedy, nr_sched);
                 let pc_pc = Self::get_pc(st.nr_perf_cri, nr_sched);
                 let pc_lc = Self::get_pc(st.nr_lat_cri, nr_sched);
+                let pc_x_migration = Self::get_pc(st.nr_x_migration, nr_sched);
+                let nr_stealee = st.nr_stealee;
                 let nr_big = st.nr_big;
                 let pc_big = Self::get_pc(nr_big, nr_sched);
                 let pc_pc_on_big = Self::get_pc(st.nr_pc_on_big, nr_big);
@@ -720,16 +763,13 @@ impl<'a> Scheduler<'a> {
 
                 StatsRes::SysStats(SysStats {
                     mseq,
-                    avg_svc_time,
                     nr_queued_task,
                     nr_active,
                     nr_sched,
-                    pc_lhp,
-                    pc_migration,
-                    pc_preemption,
-                    pc_greedy,
                     pc_pc,
                     pc_lc,
+                    pc_x_migration,
+                    nr_stealee,
                     pc_big,
                     pc_pc_on_big,
                     pc_lc_on_big,
@@ -792,47 +832,32 @@ impl<'a> Scheduler<'a> {
         Ok(())
     }
 
-    fn read_energy_profile() -> String {
-        let res =
-            File::open("/sys/devices/system/cpu/cpufreq/policy0/energy_performance_preference")
-                .and_then(|mut file| {
-                    let mut contents = String::new();
-                    file.read_to_string(&mut contents)?;
-                    Ok(contents.trim().to_string())
-                });
-
-        res.unwrap_or_else(|_| "none".to_string())
-    }
-
-    fn update_power_profile(&mut self, prev_profile: String) -> (bool, String) {
-        let profile = Self::read_energy_profile();
+    fn update_power_profile(&mut self, prev_profile: PowerProfile) -> (bool, PowerProfile) {
+        let profile = fetch_power_profile(false);
         if profile == prev_profile {
             // If the profile is the same, skip updaring the profile for BPF.
             return (true, profile);
         }
 
-        if profile == "performance" {
-            let _ = self.set_power_profile(LAVD_PM_PERFORMANCE);
-            info!("Set the scheduler's power profile to performance mode.");
-        } else if profile == "balance_performance" {
-            let _ = self.set_power_profile(LAVD_PM_BALANCED);
-            info!("Set the scheduler's power profile to balanced mode.");
-        } else if profile == "power" {
-            let _ = self.set_power_profile(LAVD_PM_POWERSAVE);
-            info!("Set the scheduler's power profile to power-save mode.");
-        } else {
-            // We don't know how to handle an unknown energy profile,
-            // so we just give up updating the profile from now on.
-            return (false, profile);
-        }
+        let _ = match profile {
+            PowerProfile::Performance => self.set_power_profile(LAVD_PM_PERFORMANCE),
+            PowerProfile::Balanced => self.set_power_profile(LAVD_PM_BALANCED),
+            PowerProfile::Powersave => self.set_power_profile(LAVD_PM_POWERSAVE),
+            PowerProfile::Unknown => {
+                // We don't know how to handle an unknown energy profile,
+                // so we just give up updating the profile from now on.
+                return (false, profile);
+            }
+        };
 
+        info!("Set the scheduler's power profile to {profile} mode.");
         (true, profile)
     }
 
     fn run(&mut self, opts: &Opts, shutdown: Arc<AtomicBool>) -> Result<UserExitInfo> {
         let (res_ch, req_ch) = self.stats_server.channels();
         let mut autopower = opts.autopower;
-        let mut profile = "unknown".to_string();
+        let mut profile = PowerProfile::Unknown;
 
         if opts.performance {
             let _ = self.set_power_profile(LAVD_PM_PERFORMANCE);
@@ -864,7 +889,7 @@ impl<'a> Scheduler<'a> {
     }
 }
 
-impl<'a> Drop for Scheduler<'a> {
+impl Drop for Scheduler<'_> {
     fn drop(&mut self) {
         if let Some(struct_ops) = self.struct_ops.take() {
             drop(struct_ops);
@@ -896,12 +921,21 @@ fn main() -> Result<()> {
     let mut opts = Opts::parse();
 
     if opts.version {
-        println!("scx_lavd {}", *build_id::SCX_FULL_VERSION);
+        println!(
+            "scx_lavd {}",
+            build_id::full_version(env!("CARGO_PKG_VERSION"))
+        );
         return Ok(());
     }
 
     if opts.help_stats {
-        stats::server_data(0).describe_meta(&mut std::io::stdout(), None)?;
+        let sys_stats_meta_name = SysStats::meta().name;
+        let sched_sample_meta_name = SchedSample::meta().name;
+        let stats_meta_names: &[&str] = &[
+            sys_stats_meta_name.as_str(),
+            sched_sample_meta_name.as_str(),
+        ];
+        stats::server_data(0).describe_meta(&mut std::io::stdout(), Some(&stats_meta_names))?;
         return Ok(());
     }
 
@@ -942,7 +976,7 @@ fn main() -> Result<()> {
         let mut sched = Scheduler::init(&opts, &mut open_object)?;
         info!(
             "scx_lavd scheduler is initialized (build ID: {})",
-            *build_id::SCX_FULL_VERSION
+            build_id::full_version(env!("CARGO_PKG_VERSION"))
         );
         info!("scx_lavd scheduler starts running.");
         if !sched.run(&opts, shutdown.clone())?.should_restart() {

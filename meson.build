@@ -1,10 +1,7 @@
 project('sched_ext schedulers', 'c',
-        version: '1.0.5',
-        license: 'GPL-2.0',)
-
-if meson.version().version_compare('<1.2')
-  error('meson >= 1.2 required')
-endif
+        version: '1.0.9',
+        license: 'GPL-2.0',
+        meson_version : '>= 1.2.0',)
 
 fs = import('fs')
 
@@ -38,6 +35,8 @@ get_bpftool_ver = find_program(join_paths(meson.current_source_dir(),
                                           'meson-scripts/get_bpftool_ver'))
 bpftool_build_skel = find_program(join_paths(meson.current_source_dir(),
                                              'meson-scripts/bpftool_build_skel'))
+bpftool_build_skel_lib = find_program(join_paths(meson.current_source_dir(),
+                                             'meson-scripts/bpftool_build_skel_lib'))
 get_sys_incls = find_program(join_paths(meson.current_source_dir(),
                                         'meson-scripts/get_sys_incls'))
 test_sched  = find_program(join_paths(meson.current_source_dir(),
@@ -50,6 +49,11 @@ fetch_bpftool = find_program(join_paths(meson.current_source_dir(),
                                       'meson-scripts/fetch_bpftool'))
 build_bpftool = find_program(join_paths(meson.current_source_dir(),
                                       'meson-scripts/build_bpftool'))
+scx_lib_name = 'lib'
+scx_lib_path = join_paths(meson.current_build_dir(), 'lib/', scx_lib_name)
+compile_scx_lib = find_program(join_paths(meson.current_source_dir(),
+                                      'meson-scripts/compile_scx_lib'))
+
 
 bpf_clang_ver = run_command(get_clang_ver, bpf_clang, check: true).stdout().strip()
 if bpf_clang_ver == ''
@@ -131,7 +135,7 @@ if should_build_libbpf
   endforeach
 
   message('Fetching libbpf repo')
-  libbpf_commit = '686f600bca59e107af4040d0838ca2b02c14ff50'
+  libbpf_commit = 'c5f22aca0f3aa855daa159b2777472b35e721804'
   run_command(fetch_libbpf, meson.current_build_dir(), libbpf_commit, check: true)
 
   make_jobs = 1
@@ -187,7 +191,7 @@ endif
 
 if should_build_bpftool
   message('Fetching bpftool repo')
-  bpftool_commit = '77a72987353fcae8ce330fd87d4c7afb7677a169'
+  bpftool_commit = '183e7010387d1fc9f08051426e9a9fbd5f8d409e'
   run_command(fetch_bpftool, meson.current_build_dir(), bpftool_commit, check: true)
 
   bpftool_target = custom_target('bpftool_target',
@@ -199,8 +203,8 @@ else
   bpftool_ver = run_command(get_bpftool_ver, bpftool_exe_path, check: true).stdout().strip()
   bpftool_maj = bpftool_ver.split('.')[0].to_int()
   bpftool_min = bpftool_ver.split('.')[1].to_int()
-  if bpftool_maj < 7 or (bpftool_maj == 7 and bpftool_min < 4)
-    error('bpftool >= 7.4 required (@0@ ver=@1@)'.format(bpftool_exe_path, bpftool_ver))
+  if bpftool_maj < 7 or (bpftool_maj == 7 and bpftool_min < 5)
+    error('bpftool >= 7.5 required (@0@ ver=@1@)'.format(bpftool_exe_path, bpftool_ver))
   endif
   # this is a noop when we're not building bpftool ourselves
   bpftool_target = custom_target('bpftool_target',
@@ -261,18 +265,34 @@ if libbpf_a != ''
   endforeach
 endif
 
+# BPF compilation uses the gen_bpf_o generator. The following should be
+# passed in as extra_args.
+bpf_includes = ['-I', join_paths(meson.current_source_dir(), 'scheds/include'),
+                '-I', join_paths(meson.current_source_dir(), 'scheds/include/arch/' + arch_dict[cpu]),
+                '-I', join_paths(meson.current_source_dir(), 'scheds/include/bpf-compat'),
+                '-I', join_paths(meson.current_source_dir(), 'scheds/include/lib'),]
+
+lib_objs = []
+subdir('lib')
+
 #
 # Generators to build BPF skel file for C schedulers.
 #
 gen_bpf_o = generator(bpf_clang,
                       output: '@BASENAME@.o',
                       depends: [libbpf],
-                      arguments: [bpf_base_cflags, '-target', 'bpf', libbpf_c_headers, '@EXTRA_ARGS@',
+                      arguments: [bpf_base_cflags, '-target', 'bpf', libbpf_c_headers, bpf_includes,
                                   '-c', '@INPUT@', '-o', '@OUTPUT@'])
+
 gen_bpf_skel = generator(bpftool_build_skel,
                          output: ['@BASENAME@.skel.h','@BASENAME@.subskel.h' ],
                          depends: [libbpf, bpftool_target],
                          arguments: [bpftool_exe_path, '@INPUT@', '@OUTPUT0@', '@OUTPUT1@'])
+
+gen_bpf_skel_lib = generator(bpftool_build_skel_lib,
+                         output: ['@BASENAME@.skel.h','@BASENAME@.subskel.h' ],
+                         depends: [libbpf, bpftool_target, scx_lib],
+                         arguments: [bpftool_exe_path, '@INPUT@', '@OUTPUT0@', '@OUTPUT1@', scx_lib_path])
 
 #
 # For rust sub-projects.
@@ -330,7 +350,7 @@ if enable_rust
   run_target('fetch', command: [cargo_fetch, cargo], env: cargo_env)
 
   rust_scheds = ['scx_lavd', 'scx_bpfland', 'scx_rustland', 'scx_rlfifo',
-                 'scx_rusty',
+                 'scx_flash', 'scx_rusty',
                  'scx_layered', 'scx_mitosis']
   rust_misc = ['scx_stats', 'scx_stats_derive', 'scx_utils',
                'scx_rustland_core',
@@ -447,6 +467,8 @@ if enable_stress
       endforeach
   endif
 endif
+
+thread_dep = dependency('threads')
 
 subdir('scheds')
 

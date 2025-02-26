@@ -21,50 +21,50 @@
 //! 2. Create a hierarchy representing load using NumaNode and Domain objects
 //!    as follows:
 //!
-//!                                                              o--------------------------------o
-//!                                                              |             LB Root            |
-//!                                                              |                                |
-//!                                                              | PushNodes: <Load, NumaNode>    |
-//!                                                              | PullNodes: <Load, NumaNode>    |
-//!                                                              | BalancedNodes: <Load, NumaNode>|
-//!                                                              o----------------o---------------o
-//!                                                                               |
-//!                                                         o---------------------o---------------------o
-//!                                                         |                     |                     |
-//!                                                         |                     |                     |
-//!                                         o---------------o----------------o   ...   o----------------o---------------o
-//!                                         |           NumaNode             |         |            NumaNode            |
-//!                                         | ID    0                        |         | ID    1                        |
-//!                                         | PushDomains <Load, Domain>     |         | PushDomains <Load, Domain>     |
-//!                                         | PullDomains <Load, Domain>     |         | PullDomains <Load, Domain>     |
-//!                                         | BalancedDomains <Domain>       |         | BalancedDomains <Domain>       |
-//!                                         | LoadSum f64                    |         | LoadSum f64                    |
-//!                                         | LoadAvg f64                    |         | LoadAvg f64                    |
-//!                                         | LoadImbal f64                  |         | LoadImbal f64                  |
-//!                                         | BalanceCost f64                |         | BalanceCost f64                |
-//!                                         | ...                            |         | ...                            |
-//!                                         o---------------o----------------o         o--------------------------------o
-//!                                                         |
-//!                                                         |
-//!                   o--------------------------------o   ...   o--------------------------------o
-//!                   |            Domain              |         |            Domain              |
-//!                   | ID    0                        |         | ID    1                        |
-//!                   | Tasks   <Load, Task>           |         | Tasks  <Load, Task>            |
-//!                   | LoadSum f64                    |         | LoadSum f64                    |
-//!                   | LoadAvg f64                    |         | LoadAvg f64                    |
-//!                   | LoadImbal f64                  |         | LoadImbal f64                  |
-//!                   | BalanceCost f64                |         | BalanceCost f64                |
-//!                   | ...                            |         | ...                            |
-//!                   o--------------------------------o         o----------------o---------------o
-//!                                                                               |
-//!                                                                               |
-//!                                         o--------------------------------o   ...   o--------------------------------o
-//!                                         |              Task              |         |              Task              |
-//!                                         | PID   0                        |         | PID   1                        |
-//!                                         | Load  f64                      |         | Load  f64                      |
-//!                                         | Migrated bool                  |         | Migrated bool                  |
-//!                                         | IsKworker bool                 |         | IsKworker bool                 |
-//!                                         o--------------------------------o         o--------------------------------o
+//!                                 o--------------------------------o
+//!                                 |             LB Root            |
+//!                                 |                                |
+//!                                 | PushNodes: <Load, NumaNode>    |
+//!                                 | PullNodes: <Load, NumaNode>    |
+//!                                 | BalancedNodes: <Load, NumaNode>|
+//!                                 o----------------o---------------o
+//!                                                  |
+//!                              o-------------------o-------------------o
+//!                              |                   |                   |
+//!                              |                   |                   |
+//!                o-------------o--------------o   ...   o--------------o-------------o
+//!                |          NumaNode          |         |           NumaNode         |
+//!                | ID    0                    |         | ID    1                    |
+//!                | PushDomains <Load, Domain> |         | PushDomains <Load, Domain> |
+//!                | PullDomains <Load, Domain> |         | PullDomains <Load, Domain> |
+//!                | BalancedDomains <Domain>   |         | BalancedDomains <Domain>   |
+//!                | LoadSum f64                |         | LoadSum f64                |
+//!                | LoadAvg f64                |         | LoadAvg f64                |
+//!                | LoadImbal f64              |         | LoadImbal f64              |
+//!                | BalanceCost f64            |         | BalanceCost f64            |
+//!                | ...                        |         | ...                        |
+//!                o-------------o--------------o         o----------------------------o
+//!                              |
+//!                              |
+//!  o----------------------o   ...   o---------------------o
+//!  |        Domain        |         |        Domain       |
+//!  | ID    0              |         | ID    1             |
+//!  | Tasks   <Load, Task> |         | Tasks  <Load, Task> |
+//!  | LoadSum f64          |         | LoadSum f64         |
+//!  | LoadAvg f64          |         | LoadAvg f64         |
+//!  | LoadImbal f64        |         | LoadImbal f64       |
+//!  | BalanceCost f64      |         | BalanceCost f64     |
+//!  | ...                  |         | ...                 |
+//!  o----------------------o         o----------o----------o
+//!                                              |
+//!                                              |
+//!                        o----------------o   ...   o----------------o
+//!                        |      Task      |         |      Task      |
+//!                        | PID   0        |         | PID   1        |
+//!                        | Load  f64      |         | Load  f64      |
+//!                        | Migrated bool  |         | Migrated bool  |
+//!                        | IsKworker bool |         | IsKworker bool |
+//!                        o----------------o         o----------------o
 //!
 //! As mentioned above, the hierarchy is created by querying BPF for each
 //! domain's duty cycle, and using the infeasible.rs crate to determine load
@@ -138,11 +138,9 @@ use std::fmt;
 use std::sync::Arc;
 
 use anyhow::bail;
-use anyhow::Context;
 use anyhow::Result;
-use libbpf_rs::MapCore as _;
 use log::debug;
-use log::warn;
+use log::trace;
 use ordered_float::OrderedFloat;
 use scx_utils::ravg::ravg_read;
 use scx_utils::LoadAggregator;
@@ -166,12 +164,6 @@ fn now_monotonic() -> u64 {
     let ret = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut time) };
     assert!(ret == 0);
     time.tv_sec as u64 * 1_000_000_000 + time.tv_nsec as u64
-}
-
-fn clear_map(map: &libbpf_rs::Map) {
-    for key in map.keys() {
-        let _ = map.delete(&key);
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -323,7 +315,7 @@ impl LoadEntity {
 
 #[derive(Debug)]
 struct TaskInfo {
-    tptr: u64,
+    taskc_p: *mut types::task_ctx,
     load: OrderedFloat<f64>,
     dom_mask: u64,
     preferred_dom_mask: u64,
@@ -338,6 +330,7 @@ impl LoadOrdered for TaskInfo {
 }
 impl_ord_for_type!(TaskInfo);
 
+#[derive(Debug)]
 struct Domain {
     id: usize,
     queried_tasks: bool,
@@ -365,29 +358,14 @@ impl Domain {
         }
     }
 
-    fn transfer_load(&mut self, load: f64, tptr: u64, other: &mut Domain, skel: &mut BpfSkel) {
-        let ctptr = (tptr as u64).to_ne_bytes();
-        let dom_id: u32 = other.id.try_into().unwrap();
+    fn transfer_load(&mut self, load: f64, taskc: &mut types::task_ctx, other: &mut Domain) {
+        trace!("XFER pid={} dom={}->{}", taskc.pid, self.id, other.id);
 
-        // Ask BPF code to execute the migration.
-        if let Err(e) =
-            skel.maps
-                .lb_data
-                .update(&ctptr, &dom_id.to_ne_bytes(), libbpf_rs::MapFlags::NO_EXIST)
-        {
-            warn!(
-                "Failed to update lb_data map for tptr={} error={:?}",
-                tptr, &e
-            );
-        }
+        let dom_id: u32 = other.id.try_into().unwrap();
+        taskc.target_dom = dom_id;
 
         self.load.add_load(-load);
         other.load.add_load(load);
-
-        debug!(
-            "  DOM {} sending [tptr: {:05}](load: {:.06}) --> DOM {} ",
-            self.id, tptr, load, other.id
-        );
     }
 
     fn xfer_between(&self, other: &Domain) -> f64 {
@@ -402,6 +380,7 @@ impl LoadOrdered for Domain {
 }
 impl_ord_for_type!(Domain);
 
+#[derive(Debug)]
 struct NumaNode {
     id: usize,
     load: LoadEntity,
@@ -583,44 +562,34 @@ impl<'a, 'b> LoadBalancer<'a, 'b> {
         const NUM_BUCKETS: u64 = bpf_intf::consts_LB_LOAD_BUCKETS as u64;
         let now_mono = now_monotonic();
         let load_half_life = self.skel.maps.rodata_data.load_half_life;
-        let dom_data = &self.skel.maps.dom_data;
 
         let mut aggregator =
             LoadAggregator::new(self.dom_group.weight(), !self.lb_apply_weight.clone());
 
-        for dom_id in self.dom_group.doms().keys() {
-            let dom = *dom_id;
-            let dom_key = unsafe { std::mem::transmute::<u32, [u8; 4]>(dom as u32) };
+        for (dom_id, dom) in self.dom_group.doms() {
+            aggregator.init_domain(*dom_id);
 
-            aggregator.init_domain(dom);
+            let dom_ctx = dom.ctx().unwrap();
 
-            if let Some(dom_ctx_map_elem) = dom_data
-                .lookup(&dom_key, libbpf_rs::MapFlags::ANY)
-                .context("Failed to lookup dom_ctx")?
-            {
-                let dom_ctx =
-                    unsafe { &*(dom_ctx_map_elem.as_slice().as_ptr() as *const bpf_intf::dom_ctx) };
+            for bucket in 0..NUM_BUCKETS {
+                let bucket_ctx = &dom_ctx.buckets[bucket as usize];
+                let rd = &bucket_ctx.rd;
+                let duty_cycle = ravg_read(
+                    rd.val,
+                    rd.val_at,
+                    rd.old,
+                    rd.cur,
+                    now_mono,
+                    load_half_life,
+                    RAVG_FRAC_BITS,
+                );
 
-                for bucket in 0..NUM_BUCKETS {
-                    let bucket_ctx = dom_ctx.buckets[bucket as usize];
-                    let rd = &bucket_ctx.rd;
-                    let duty_cycle = ravg_read(
-                        rd.val,
-                        rd.val_at,
-                        rd.old,
-                        rd.cur,
-                        now_mono,
-                        load_half_life,
-                        RAVG_FRAC_BITS,
-                    );
-
-                    if duty_cycle == 0.0f64 {
-                        continue;
-                    }
-
-                    let weight = self.bucket_weight(bucket);
-                    aggregator.record_dom_load(dom, weight, duty_cycle)?;
+                if duty_cycle == 0.0f64 {
+                    continue;
                 }
+
+                let weight = self.bucket_weight(bucket);
+                aggregator.record_dom_load(*dom_id, weight, duty_cycle)?;
             }
         }
 
@@ -659,67 +628,63 @@ impl<'a, 'b> LoadBalancer<'a, 'b> {
         }
         dom.queried_tasks = true;
 
-        // Read active_tptrs and update read_idx and gen.
+        // Read active_tasks and update read_idx and gen.
         const MAX_TPTRS: u64 = bpf_intf::consts_MAX_DOM_ACTIVE_TPTRS as u64;
-        let active_tptrs = &mut self.skel.maps.bss_data.dom_active_tptrs[dom.id];
-        let (mut ridx, widx) = (active_tptrs.read_idx, active_tptrs.write_idx);
-        active_tptrs.read_idx = active_tptrs.write_idx;
-        active_tptrs.gen += 1;
+        let dom_ctx = unsafe { &mut *self.skel.maps.bss_data.dom_ctxs[dom.id] };
+        let active_tasks = &mut dom_ctx.active_tasks;
 
-        let active_tptrs = &self.skel.maps.bss_data.dom_active_tptrs[dom.id];
+        let (mut ridx, widx) = (active_tasks.read_idx, active_tasks.write_idx);
+        active_tasks.read_idx = active_tasks.write_idx;
+        active_tasks.gen += 1;
+
         if widx - ridx > MAX_TPTRS {
             ridx = widx - MAX_TPTRS;
         }
 
         // Read task_ctx and load.
         let load_half_life = self.skel.maps.rodata_data.load_half_life;
-        let task_data = &self.skel.maps.task_data;
         let now_mono = now_monotonic();
 
         for idx in ridx..widx {
-            let tptr = active_tptrs.tptrs[(idx % MAX_TPTRS) as usize];
-            let key = unsafe { std::mem::transmute::<u64, [u8; 8]>(tptr) };
+            let taskc_p = active_tasks.tasks[(idx % MAX_TPTRS) as usize];
+            let taskc = unsafe { &mut *taskc_p };
 
-            if let Some(task_data_elem) = task_data.lookup(&key, libbpf_rs::MapFlags::ANY)? {
-                let task_ctx =
-                    unsafe { &*(task_data_elem.as_slice().as_ptr() as *const bpf_intf::task_ctx) };
-                if task_ctx.dom_id as usize != dom.id {
-                    continue;
-                }
-
-                let rd = &task_ctx.dcyc_rd;
-                let mut load = ravg_read(
-                    rd.val,
-                    rd.val_at,
-                    rd.old,
-                    rd.cur,
-                    now_mono,
-                    load_half_life,
-                    RAVG_FRAC_BITS,
-                );
-
-                let weight = if self.lb_apply_weight {
-                    (task_ctx.weight as f64).min(self.infeas_threshold)
-                } else {
-                    DEFAULT_WEIGHT
-                };
-                load *= weight;
-
-                dom.tasks.insert(TaskInfo {
-                    tptr,
-                    load: OrderedFloat(load),
-                    dom_mask: task_ctx.dom_mask,
-                    preferred_dom_mask: task_ctx.preferred_dom_mask,
-                    migrated: Cell::new(false),
-                    is_kworker: task_ctx.is_kworker,
-                });
+            if taskc.target_dom as usize != dom.id {
+                continue;
             }
+
+            let rd = &taskc.dcyc_rd;
+            let mut load = ravg_read(
+                rd.val,
+                rd.val_at,
+                rd.old,
+                rd.cur,
+                now_mono,
+                load_half_life,
+                RAVG_FRAC_BITS,
+            );
+
+            let weight = if self.lb_apply_weight {
+                (taskc.weight as f64).min(self.infeas_threshold)
+            } else {
+                DEFAULT_WEIGHT
+            };
+            load *= weight;
+
+            dom.tasks.insert(TaskInfo {
+                taskc_p,
+                load: OrderedFloat(load),
+                dom_mask: taskc.dom_mask,
+                preferred_dom_mask: taskc.preferred_dom_mask,
+                migrated: Cell::new(false),
+                is_kworker: unsafe { taskc.is_kworker.assume_init() },
+            });
         }
 
         Ok(())
     }
 
-    // Find the first candidate tptr which hasn't already been migrated and
+    // Find the first candidate task which hasn't already been migrated and
     // can run in @pull_dom.
     fn find_first_candidate<'d, I>(tasks_by_load: I) -> Option<&'d TaskInfo>
     where
@@ -759,8 +724,8 @@ impl<'a, 'b> LoadBalancer<'a, 'b> {
             .into_iter()
             .filter(|task| {
                 task.dom_mask & (1 << pull_dom_id) != 0
-                    || !(self.skip_kworkers && task.is_kworker)
-                    || !task.migrated.get()
+                    && !(self.skip_kworkers && task.is_kworker)
+                    && !task.migrated.get()
             })
             .collect();
 
@@ -779,7 +744,10 @@ impl<'a, 'b> LoadBalancer<'a, 'b> {
                     .filter(|x| x.load >= OrderedFloat(to_xfer) && task_filter(x, pull_dom_id)),
             ),
         ) {
-            (None, None) => return Ok(None),
+            (None, None) => {
+                std::mem::swap(&mut push_dom.tasks, &mut SortedVec::from_unsorted(tasks));
+                return Ok(None);
+            }
             (Some(task), None) | (None, Some(task)) => (task, calc_new_imbal(*task.load)),
             (Some(task0), Some(task1)) => {
                 let (new_imbal0, new_imbal1) =
@@ -801,11 +769,11 @@ impl<'a, 'b> LoadBalancer<'a, 'b> {
         }
 
         let load = *(task.load);
-        let tptr = task.tptr;
+        let taskc_p = task.taskc_p;
         task.migrated.set(true);
         std::mem::swap(&mut push_dom.tasks, &mut SortedVec::from_unsorted(tasks));
 
-        push_dom.transfer_load(load, tptr, pull_dom, &mut self.skel);
+        push_dom.transfer_load(load, unsafe { &mut *taskc_p }, pull_dom);
         Ok(Some(load))
     }
 
@@ -818,7 +786,7 @@ impl<'a, 'b> LoadBalancer<'a, 'b> {
 
         let push_imbal = push_node.load.imbal();
         let pull_imbal = pull_node.load.imbal();
-        let xfer = push_node.xfer_between(&pull_node);
+        let xfer = push_node.xfer_between(pull_node);
 
         if push_imbal <= 0.0f64 || pull_imbal >= 0.0f64 {
             bail!(
@@ -872,7 +840,7 @@ impl<'a, 'b> LoadBalancer<'a, 'b> {
                     break;
                 }
             }
-            while pullers.len() > 0 {
+            while !pullers.is_empty() {
                 pull_node.domains.insert(pullers.pop().unwrap());
             }
             pushers.push_back(push_dom);
@@ -880,7 +848,7 @@ impl<'a, 'b> LoadBalancer<'a, 'b> {
                 break;
             }
         }
-        while pushers.len() > 0 {
+        while !pushers.is_empty() {
             push_node.domains.insert(pushers.pop_front().unwrap());
         }
 
@@ -970,7 +938,7 @@ impl<'a, 'b> LoadBalancer<'a, 'b> {
                     );
                 }
             }
-            while pullers.len() > 0 {
+            while !pullers.is_empty() {
                 self.nodes.insert(pullers.pop().unwrap());
             }
 
@@ -980,7 +948,7 @@ impl<'a, 'b> LoadBalancer<'a, 'b> {
             pushers.push_back(push_node);
         }
 
-        while pushers.len() > 0 {
+        while !pushers.is_empty() {
             self.nodes.insert(pushers.pop_front().unwrap());
         }
 
@@ -1087,8 +1055,6 @@ impl<'a, 'b> LoadBalancer<'a, 'b> {
     }
 
     fn perform_balancing(&mut self) -> Result<()> {
-        clear_map(&self.skel.maps.lb_data);
-
         // First balance load between the NUMA nodes. Balancing here has a
         // higher cost function than balancing between domains inside of NUMA
         // nodes, but the mechanics are the same. Adjustments made here are

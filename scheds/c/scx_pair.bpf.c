@@ -124,7 +124,7 @@ char _license[] SEC("license") = "GPL";
 const volatile u32 nr_cpu_ids = 1;
 
 /* a pair of CPUs stay on a cgroup for this duration */
-const volatile u32 pair_batch_dur_ns = SCX_SLICE_DFL;
+const volatile u32 pair_batch_dur_ns;
 
 /* cpu ID -> pair cpu ID */
 const volatile s32 RESIZABLE_ARRAY(rodata, pair_cpu);
@@ -239,11 +239,6 @@ u64 nr_cgrp_next, nr_cgrp_coll, nr_cgrp_empty;
 
 UEI_DEFINE(uei);
 
-static bool time_before(u64 a, u64 b)
-{
-	return (s64)(a - b) < 0;
-}
-
 void BPF_STRUCT_OPS(pair_enqueue, struct task_struct *p, u64 enq_flags)
 {
 	struct cgroup *cgrp;
@@ -318,7 +313,7 @@ static int try_dispatch(s32 cpu)
 	struct pair_ctx *pairc;
 	struct bpf_map *cgq_map;
 	struct task_struct *p;
-	u64 now = bpf_ktime_get_ns();
+	u64 now = scx_bpf_now();
 	bool kick_pair = false;
 	bool expired, pair_preempted;
 	u32 *vptr, in_pair_mask;
@@ -477,7 +472,7 @@ static int try_dispatch(s32 cpu)
 	p = bpf_task_from_pid(pid);
 	if (p) {
 		__sync_fetch_and_add(&nr_dispatched, 1);
-		scx_bpf_dispatch(p, SCX_DSQ_GLOBAL, SCX_SLICE_DFL, 0);
+		scx_bpf_dsq_insert(p, SCX_DSQ_GLOBAL, SCX_SLICE_DFL, 0);
 		bpf_task_release(p);
 	} else {
 		/* we don't handle dequeues, retry on lost tasks */

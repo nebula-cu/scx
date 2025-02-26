@@ -30,10 +30,11 @@ char _license[] SEC("license") = "GPL";
  */
 /* Adds additional checks to ensure correctness */
 const volatile bool debug = false;
-const volatile u64 slice_ns = SCX_SLICE_DFL;
 const volatile u32 nr_possible_cpus = 1;
 const volatile bool smt_enabled = true;
 const volatile unsigned char all_cpus[MAX_CPUS_U8];
+
+const volatile u64 slice_ns;
 
 /*
 * user_global_seq is bumped by userspace to indicate that a new configuration
@@ -236,6 +237,91 @@ static inline const struct cpumask *lookup_cell_cpumask(int idx)
 }
 
 /*
+ * This is an RCU-like implementation to keep track of scheduling events so we
+ * can establish when cell assignments have propagated completely.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__type(key, u32);
+	__type(value, u32);
+	__uint(max_entries, 1);
+} percpu_critical_sections SEC(".maps");
+
+/* Same implementation for enter/exit */
+static __always_inline int critical_section()
+{
+	u32 zero = 0;
+	u32 *data;
+
+	if (!(data = bpf_map_lookup_elem(&percpu_critical_sections, &zero))) {
+		scx_bpf_error("no percpu_critical_sections");
+		return -1;
+	}
+
+	/*
+	 * Bump the counter, the LSB indicates we are in a critical section and the
+	 * rest of the bits keep track of how many critical sections.
+	 */
+	WRITE_ONCE(*data, *data + 1);
+	return 0;
+}
+
+#define critical_section_enter() critical_section()
+#define critical_section_exit() critical_section()
+
+u32 critical_section_state[MAX_CPUS];
+/*
+ * Write side will record the current state and then poll to check that the
+ * generation has advanced (somewhat like call_rcu)
+ */
+static __always_inline int critical_section_record()
+{
+	u32 zero = 0;
+	u32 *data;
+	int nr_cpus = nr_possible_cpus;
+	if (nr_cpus > MAX_CPUS)
+		nr_cpus = MAX_CPUS;
+
+	for (int i = 0; i < nr_cpus; ++i) {
+		if (!(data = bpf_map_lookup_percpu_elem(
+			      &percpu_critical_sections, &zero, i))) {
+			scx_bpf_error("no percpu_critical_sections");
+			return -1;
+		}
+
+		critical_section_state[i] = READ_ONCE(*data);
+	}
+	return 0;
+}
+
+static __always_inline int critical_section_poll()
+{
+	u32 zero = 0;
+	u32 *data;
+
+	int nr_cpus = nr_possible_cpus;
+	if (nr_cpus > MAX_CPUS)
+		nr_cpus = MAX_CPUS;
+
+	for (int i = 0; i < nr_cpus; ++i) {
+		/* If not in a critical section at the time of record, then it passes */
+		if (!(critical_section_state[i] & 1))
+			continue;
+
+		if (!(data = bpf_map_lookup_percpu_elem(
+			      &percpu_critical_sections, &zero, i))) {
+			scx_bpf_error("no percpu_critical_sections");
+			return -1;
+		}
+
+		if (READ_ONCE(*data) == critical_section_state[i])
+			return 1;
+	}
+
+	return 0;
+}
+
+/*
 * Along with a user_global_seq bump, indicates that cgroup->cell assignment
 * changed
 */
@@ -264,6 +350,16 @@ int BPF_PROG(sched_tick_fentry)
 	 * scheduler tick. This is a crude way of mimicing RCU synchronization.
 	 */
 	if (READ_ONCE(draining)) {
+		if (critical_section_poll())
+			return 0;
+		/* FIXME: If a cell is being destroyed, we need to make sure that dsq is
+		 * drained before removing it from all the cpus
+		 *
+		 * Additionally, the handling of pinned tasks is broken here - we send
+		 * them to a cell DSQ if there's overlap of the cell's CPUs and the
+		 * task's cpumask but if the cell's CPU change we might stall the
+		 * task indefinitely.
+		 */
 		bpf_for(cpu_idx, 0, nr_possible_cpus)
 		{
 			if (!(cpu_ctx = lookup_cpu_ctx(cpu_idx)))
@@ -422,6 +518,11 @@ int BPF_PROG(sched_tick_fentry)
 	/* Bump the global seq last to ensure that prior stores are now visible. This synchronizes with the read of global_seq */
 	barrier();
 	WRITE_ONCE(global_seq, global_seq + 1);
+	/*
+	 * On subsequent ticks we'll check that all in-flight enqueues are done so
+	 * we can clear the prev_cell for each cpu. Record the state here.
+	 */
+	critical_section_record();
 	return 0;
 }
 
@@ -611,21 +712,33 @@ s32 BPF_STRUCT_OPS(mitosis_select_cpu, struct task_struct *p, s32 prev_cpu,
 	if (!(cctx = lookup_cpu_ctx(-1)) || !(tctx = lookup_task_ctx(p)))
 		return prev_cpu;
 
-	if (maybe_refresh_cell(p, tctx) < 0)
-		return prev_cpu;
+	/*
+	 * This is a lightweight (RCU-like) critical section covering from when we
+	 * refresh cell information to when we enqueue onto the task's assigned
+	 * cell's DSQ. This allows us to publish new cell assignments and establish
+	 * a point at which all future enqueues will be on the new assignments.
+	 */
+	critical_section_enter();
+	if (maybe_refresh_cell(p, tctx) < 0) {
+		cpu = prev_cpu;
+		goto out;
+	}
 
 	if ((cpu = pick_idle_cpu(p, prev_cpu, cctx, tctx)) >= 0) {
 		cstat_inc(CSTAT_LOCAL, tctx->cell, cctx);
-		scx_bpf_dispatch(p, SCX_DSQ_LOCAL, slice_ns, 0);
+		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, slice_ns, 0);
 		if (debug && !READ_ONCE(draining) && tctx->all_cpus_allowed &&
 		    (cctx = lookup_cpu_ctx(cpu)) && cctx->cell != tctx->cell)
 			scx_bpf_error(
 				"select_cpu returned cpu %d belonging to cell %d but task belongs to cell %d",
 				cpu, cctx->cell, tctx->cell);
-		return cpu;
+		goto out;
 	}
 
-	return prev_cpu;
+	cpu = prev_cpu;
+out:
+	critical_section_exit();
+	return cpu;
 }
 
 static __always_inline bool pick_idle_cpu_and_kick(struct task_struct *p,
@@ -645,11 +758,6 @@ static __always_inline bool pick_idle_cpu_and_kick(struct task_struct *p,
 	}
 }
 
-static inline bool vtime_before(u64 a, u64 b)
-{
-	return (s64)(a - b) < 0;
-}
-
 void BPF_STRUCT_OPS(mitosis_enqueue, struct task_struct *p, u64 enq_flags)
 {
 	struct cpu_ctx *cctx;
@@ -661,26 +769,33 @@ void BPF_STRUCT_OPS(mitosis_enqueue, struct task_struct *p, u64 enq_flags)
 	if (!(cctx = lookup_cpu_ctx(-1)) || !(tctx = lookup_task_ctx(p)))
 		return;
 
+	/*
+	 * This is a lightweight (RCU-like) critical section covering from when we
+	 * refresh cell information to when we enqueue onto the task's assigned
+	 * cell's DSQ. This allows us to publish new cell assignments and establish
+	 * a point at which all future enqueues will be on the new assignments.
+	 */
+	critical_section_enter();
 	if (maybe_refresh_cell(p, tctx) < 0)
-		return;
+		goto out;
 
 	if (!(cell = lookup_cell(tctx->cell)))
-		return;
+		goto out;
 
 	/*
 	 * Limit the amount of budget that an idling task can accumulate
 	 * to one slice.
 	 */
-	if (vtime_before(vtime, cell->vtime_now - slice_ns))
+	if (time_before(vtime, cell->vtime_now - slice_ns))
 		vtime = cell->vtime_now - slice_ns;
 
 	if (p->flags & PF_KTHREAD && p->nr_cpus_allowed == 1) {
-		scx_bpf_dispatch(p, HI_FALLBACK_DSQ, slice_ns, 0);
+		scx_bpf_dsq_insert(p, HI_FALLBACK_DSQ, slice_ns, 0);
 	} else if (!tctx->all_cpus_allowed) {
-		scx_bpf_dispatch(p, LO_FALLBACK_DSQ, slice_ns, 0);
+		scx_bpf_dsq_insert(p, LO_FALLBACK_DSQ, slice_ns, 0);
 	} else {
-		scx_bpf_dispatch_vtime(p, tctx->cell, slice_ns, vtime,
-				       enq_flags);
+		scx_bpf_dsq_insert_vtime(p, tctx->cell, slice_ns, vtime,
+					 enq_flags);
 	}
 
 	/*
@@ -689,6 +804,8 @@ void BPF_STRUCT_OPS(mitosis_enqueue, struct task_struct *p, u64 enq_flags)
 	 */
 	if (!(enq_flags & SCX_ENQ_WAKEUP))
 		pick_idle_cpu_and_kick(p, task_cpu, cctx, tctx);
+out:
+	critical_section_exit();
 }
 
 void BPF_STRUCT_OPS(mitosis_dispatch, s32 cpu, struct task_struct *prev)
@@ -702,7 +819,7 @@ void BPF_STRUCT_OPS(mitosis_dispatch, s32 cpu, struct task_struct *prev)
 	prev_cell = *(volatile u32 *)&cctx->prev_cell;
 	cell = *(volatile u32 *)&cctx->cell;
 
-	if (scx_bpf_consume(HI_FALLBACK_DSQ))
+	if (scx_bpf_dsq_move_to_local(HI_FALLBACK_DSQ))
 		return;
 
 	/*
@@ -710,13 +827,13 @@ void BPF_STRUCT_OPS(mitosis_dispatch, s32 cpu, struct task_struct *prev)
 	 * scheduling racing with assignment change, we schedule from the previous
 	 * cell first to make sure it drains.
 	 */
-	if (prev_cell != cell && scx_bpf_consume(prev_cell))
+	if (prev_cell != cell && scx_bpf_dsq_move_to_local(prev_cell))
 		return;
 
-	if (scx_bpf_consume(cell))
+	if (scx_bpf_dsq_move_to_local(cell))
 		return;
 
-	scx_bpf_consume(LO_FALLBACK_DSQ);
+	scx_bpf_dsq_move_to_local(LO_FALLBACK_DSQ);
 }
 
 static inline void runnable(struct task_struct *p, struct task_ctx *tctx,
@@ -731,7 +848,7 @@ static inline void runnable(struct task_struct *p, struct task_ctx *tctx,
 		tctx->cell = cgc->cell;
 	}
 
-	adj_load(p, tctx, cgrp, p->scx.weight, bpf_ktime_get_ns());
+	adj_load(p, tctx, cgrp, p->scx.weight, scx_bpf_now());
 }
 
 void BPF_STRUCT_OPS(mitosis_runnable, struct task_struct *p, u64 enq_flags)
@@ -758,10 +875,10 @@ void BPF_STRUCT_OPS(mitosis_running, struct task_struct *p)
 	if (!(tctx = lookup_task_ctx(p)) || !(cell = lookup_cell(tctx->cell)))
 		return;
 
-	if (vtime_before(cell->vtime_now, p->scx.dsq_vtime))
+	if (time_before(cell->vtime_now, p->scx.dsq_vtime))
 		cell->vtime_now = p->scx.dsq_vtime;
 
-	tctx->started_running_at = bpf_ktime_get_ns();
+	tctx->started_running_at = scx_bpf_now();
 }
 
 void BPF_STRUCT_OPS(mitosis_stopping, struct task_struct *p, bool runnable)
@@ -779,7 +896,7 @@ void BPF_STRUCT_OPS(mitosis_stopping, struct task_struct *p, bool runnable)
 	if (!(cell = lookup_cell(cidx)))
 		return;
 
-	used = bpf_ktime_get_ns() - tctx->started_running_at;
+	used = scx_bpf_now() - tctx->started_running_at;
 	/* scale the execution time by the inverse of the weight and charge */
 	p->scx.dsq_vtime += used * 100 / p->scx.weight;
 
@@ -799,7 +916,7 @@ static inline void quiescent(struct task_struct *p, struct cgroup *cgrp)
 	if (!(tctx = lookup_task_ctx(p)))
 		return;
 
-	adj_load(p, tctx, cgrp, -(s64)p->scx.weight, bpf_ktime_get_ns());
+	adj_load(p, tctx, cgrp, -(s64)p->scx.weight, scx_bpf_now());
 }
 
 void BPF_STRUCT_OPS(mitosis_quiescent, struct task_struct *p, u64 deq_flags)

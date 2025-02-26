@@ -16,11 +16,7 @@ private(LAVD) struct bpf_cpumask __kptr *big_cpumask; /* CPU mask for big CPUs *
 private(LAVD) struct bpf_cpumask __kptr *little_cpumask; /* CPU mask for little CPUs */
 private(LAVD) struct bpf_cpumask __kptr *active_cpumask; /* CPU mask for active CPUs */
 private(LAVD) struct bpf_cpumask __kptr *ovrflw_cpumask; /* CPU mask for overflow CPUs */
-private(LAVD) struct bpf_cpumask cpdom_cpumask[LAVD_CPDOM_MAX_NR+1]; /* CPU mask for each compute domain */
-								/* 
-								 * I am sure that +1 shouldn't be necessary here.
-								 * But it is added to workaround a verifier bug (?).
-								 */
+private(LAVD) struct bpf_cpumask cpdom_cpumask[LAVD_CPDOM_MAX_NR]; /* CPU mask for each compute domain */
 
 const volatile u64	nr_cpu_ids;	/* maximum CPU IDs */
 static volatile u64	nr_cpus_onln;	/* current number of online CPUs */
@@ -42,7 +38,7 @@ const volatile u32 	is_smt_active;
 const volatile u8	verbose;
 
 /*
- * Exit infomation
+ * Exit information
  */
 UEI_DEFINE(uei);
 
@@ -160,14 +156,6 @@ static struct task_ctx *get_task_ctx(struct task_struct *p)
 	return taskc;
 }
 
-struct task_ctx *try_get_current_task_ctx(void)
-{
-	struct task_struct *p = bpf_get_current_task_btf();
-	struct task_ctx *taskc = try_get_task_ctx(p);
-
-	return taskc;
-}
-
 static struct cpu_ctx *get_cpu_ctx(void)
 {
 	const u32 idx = 0;
@@ -228,21 +216,27 @@ static bool is_kernel_task(struct task_struct *p)
 	return !!(p->flags & PF_KTHREAD);
 }
 
+static bool is_per_cpu_task(const struct task_struct *p)
+{
+	if (p->nr_cpus_allowed == 1 || is_migration_disabled(p))
+		return true;
+
+	return false;
+}
+
+static bool have_idle_cpus(const struct cpumask *idle_mask)
+{
+	return !bpf_cpumask_empty(idle_mask);
+}
+
 static bool is_lat_cri(struct task_ctx *taskc, struct sys_stat *stat_cur)
 {
 	return taskc->lat_cri >= stat_cur->avg_lat_cri;
 }
 
-static bool is_perf_cri(struct task_ctx *taskc, struct sys_stat *stat_cur)
-{
-	if (READ_ONCE(taskc->on_big) && READ_ONCE(taskc->on_little))
-		return taskc->perf_cri >= stat_cur->thr_perf_cri;
-	return READ_ONCE(taskc->on_big);
-}
-
 static bool is_greedy(struct task_ctx *taskc)
 {
-	return taskc->greedy_ratio > 1000;
+	return taskc->is_greedy;
 }
 
 static bool is_eligible(struct task_ctx *taskc)
@@ -252,7 +246,7 @@ static bool is_eligible(struct task_ctx *taskc)
 
 static bool is_lock_holder(struct task_ctx *taskc)
 {
-	return (taskc->lock_boost > 0) || (taskc->futex_boost > 0);
+	return taskc->futex_boost > 0;
 }
 
 static bool have_scheduled(struct task_ctx *taskc)
@@ -318,3 +312,14 @@ static void set_on_core_type(struct task_ctx *taskc,
 	WRITE_ONCE(taskc->on_big, on_big);
 	WRITE_ONCE(taskc->on_little, on_little);
 }
+
+static bool prob_x_out_of_y(u32 x, u32 y)
+{
+	/*
+	 * [0, r, y)
+	 *  ---- x?
+	 */
+	u32 r = bpf_get_prandom_u32() % y;
+	return r < x;
+}
+

@@ -24,6 +24,7 @@
  * Copyright (c) 2023 Tejun Heo <tj@kernel.org>
  */
 #include <scx/common.bpf.h>
+#include <lib/sdt_task.h>
 
 #include "scx_nest.h"
 
@@ -42,12 +43,11 @@ enum {
 };
 
 #define CLOCK_BOOTTIME 7
-#define NUMA_NO_NODE -1
 
 const volatile u64 p_remove_ns = 2 * NSEC_PER_MSEC;
 const volatile u64 r_max = 5;
 const volatile u64 r_impatient = 2;
-const volatile u64 slice_ns = SCX_SLICE_DFL;
+const volatile u64 slice_ns;
 const volatile bool find_fully_idle = false;
 const volatile u64 sampling_cadence_ns = 1 * NSEC_PER_SEC;
 const volatile u64 r_depth = 5;
@@ -386,7 +386,7 @@ migrate_primary:
 	}
 	bpf_rcu_read_unlock();
 	update_attached(tctx, prev_cpu, cpu);
-	scx_bpf_dispatch(p, SCX_DSQ_LOCAL, slice_ns, 0);
+	scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, slice_ns, 0);
 	return cpu;
 }
 
@@ -408,8 +408,8 @@ void BPF_STRUCT_OPS(nest_enqueue, struct task_struct *p, u64 enq_flags)
 	if (vtime_before(vtime, vtime_now - slice_ns))
 		vtime = vtime_now - slice_ns;
 
-	scx_bpf_dispatch_vtime(p, FALLBACK_DSQ_ID, slice_ns, vtime,
-			       enq_flags);
+	scx_bpf_dsq_insert_vtime(p, FALLBACK_DSQ_ID, slice_ns, vtime,
+				 enq_flags);
 }
 
 void BPF_STRUCT_OPS(nest_dispatch, s32 cpu, struct task_struct *prev)
@@ -432,11 +432,11 @@ void BPF_STRUCT_OPS(nest_dispatch, s32 cpu, struct task_struct *prev)
 		return;
 	}
 
-	if (!scx_bpf_consume(FALLBACK_DSQ_ID)) {
+	if (!scx_bpf_dsq_move_to_local(FALLBACK_DSQ_ID)) {
 		in_primary = bpf_cpumask_test_cpu(cpu, cast_mask(primary));
 
 		if (prev && (prev->scx.flags & SCX_TASK_QUEUED) && in_primary) {
-			scx_bpf_dispatch(prev, SCX_DSQ_LOCAL, slice_ns, 0);
+			scx_bpf_dsq_insert(prev, SCX_DSQ_LOCAL, slice_ns, 0);
 			return;
 		}
 
