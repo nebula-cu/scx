@@ -80,6 +80,22 @@ static inline bool is_kthread(const struct task_struct* p) {
 }
 
 static s32 pick_idle_cpu(struct task_struct* p, s32 prev_cpu, u64 wake_flags) {
+//   s32 pid = p->pid;
+//   s32 tgid = p->tgid;
+
+//   // Storing the information about cpu in cpu_ctx seems inefficient, since we need to query that every time.
+  
+//   struct cpu_ctx* cctx = try_lookup_cpu_ctx(prev_cpu);
+//   if (!cctx) {
+//     trace("pick_idle_cpu: cpu ctx lookup failed");
+//   } else {
+//     if (cctx->vm_id == tgid) {
+//       return prev_cpu;
+//     }
+//   }
+
+  
+
   if (scx_bpf_test_and_clear_cpu_idle(prev_cpu))
     return prev_cpu;
 
@@ -207,10 +223,13 @@ void BPF_STRUCT_OPS(rorke_stopping, struct task_struct* p, bool runnable) {
   __sync_fetch_and_sub(&nr_running, 1);
 }
 
+#define HYSTERESIS_THRESHOLD 1  // Min difference before reallocating
+
 static void realloc_cpu_to_vm() {
   u32 cpu, vm, total_tasks = 0;
   u64 vm_task_counts[MAX_VMS] = {0};
-  u32 vm_cpu_allocs[MAX_VMS] = {0};
+  u64 vm_cpu_allocs[MAX_VMS] = {0};
+  u64 prev_alloc[MAX_VMS] = {0};  // Track previous allocations
 
   /* Count tasks in each VM queue */
   bpf_for(vm, 0, nr_vms) {
@@ -218,27 +237,32 @@ static void realloc_cpu_to_vm() {
     total_tasks += vm_task_counts[vm];
   }
 
-  /* If no tasks, reset CPU allocations */
+  /* If no tasks, don't change allocations */
   if (total_tasks == 0) {
-    bpf_for(cpu, 0, nr_cpus) {
-      // Skip central CPU
-      if (cpu == central_cpu)
-        continue;
-      struct cpu_ctx* cctx = try_lookup_cpu_ctx(cpu);
-      if (cctx)
-        cctx->vm_id = 0;  // No VM assigned
-    }
     return;
   }
 
-  /* Compute proportional CPU allocations */
+  /* Compute new proportional CPU allocations */
   bpf_for(vm, 0, nr_vms) {
     if (vm_task_counts[vm] > 0) {
-      vm_cpu_allocs[vm] = (vm_task_counts[vm] * nr_cpus) / total_tasks;
+      vm_cpu_allocs[vm] = (vm_task_counts[vm] * (nr_cpus - 1)) / total_tasks;
     }
   }
 
-  /* Assign CPUs to VMs */
+  /* Apply hysteresis to reduce CPU movement */
+  bpf_for(vm, 0, nr_vms) {
+    u32 diff = (vm_cpu_allocs[vm] >= prev_alloc[vm]) 
+               ? (vm_cpu_allocs[vm] - prev_alloc[vm]) 
+               : (prev_alloc[vm] - vm_cpu_allocs[vm]);  // Compute absolute difference manually
+
+    if (diff < HYSTERESIS_THRESHOLD) {
+      vm_cpu_allocs[vm] = prev_alloc[vm];  // Keep previous allocation
+    } else {
+      prev_alloc[vm] = vm_cpu_allocs[vm];  // Update previous allocation
+    }
+  }
+
+  /* Assign CPUs based on adjusted allocation */
   u32 assigned_cpus = 0;
   bpf_for(cpu, 0, nr_cpus) {
     if (cpu == central_cpu)
@@ -247,10 +271,12 @@ static void realloc_cpu_to_vm() {
     if (!cctx)
       continue;
 
-    /* Find a VM with remaining CPU allocations */
-    for (vm = 0; vm < nr_vms; vm++) {
+      bpf_for(vm, 0, nr_vms) {
       if (vm_cpu_allocs[vm] > 0) {
-        cctx->vm_id = vms[vm];
+        /* Only assign if the VM ID actually changes */
+        if (cctx->vm_id != vms[vm]) {
+          cctx->vm_id = vms[vm];
+        }
         vm_cpu_allocs[vm]--;
         assigned_cpus++;
         break;
@@ -258,7 +284,7 @@ static void realloc_cpu_to_vm() {
     }
   }
 
-  trace("realloc_cpu_to_vm: Distributed %d CPUs across %d VMs", assigned_cpus, nr_vms);
+  trace("realloc_cpu_to_vm: Distributed %d CPUs across %d VMs with hysteresis", assigned_cpus, nr_vms);
 }
 
 
