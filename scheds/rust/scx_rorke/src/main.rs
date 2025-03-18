@@ -17,7 +17,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
-use libc::{cpu_set_t, pid_t, sched_param, sched_setaffinity, sched_setscheduler, CPU_SET};
+use libc::{sched_param, sched_setscheduler};
 
 use anyhow::anyhow;
 use anyhow::Context;
@@ -55,10 +55,6 @@ lazy_static::lazy_static! {
 
 #[derive(Debug, Parser)]
 struct Opts {
-    /// Central CPU
-    #[clap(short = 'c', long, default_value = "0")]
-    central_cpu: u32,
-
     /// Number of CPUs
     #[clap(short = 'n', long, default_value = "2")]
     num_cpus: u32,
@@ -175,6 +171,7 @@ struct Scheduler<'a> {
 impl<'a> Scheduler<'a> {
     fn init(opts: &Opts, open_object: &'a mut MaybeUninit<OpenObject>) -> Result<Self> {
         set_rlimit_infinity();
+
         // Open the eBPF object for verification
         let mut skel_builder = BpfSkelBuilder::default();
         skel_builder.obj_builder.debug(opts.verbose > 0);
@@ -187,7 +184,6 @@ impl<'a> Scheduler<'a> {
         let mut skel = scx_ops_open!(skel_builder, open_object, rorke).unwrap();
 
         // Parse json config file
-
         let config_path = match &opts.config_file {
             Some(path) => PathBuf::from(path),
             None => {
@@ -202,38 +198,19 @@ impl<'a> Scheduler<'a> {
         info!("CPU allocation: {:?}", cpu_allocation);
 
         // Initialize skel
-        skel.maps.rodata_data.central_cpu = opts.central_cpu;
         skel.maps.rodata_data.nr_cpus = opts.num_cpus;
         skel.maps.rodata_data.nr_vms = vm_config.len() as u32;
         skel.maps.rodata_data.timer_interval_ns = opts.timer_interval * 1000;
-
         for (i, vm) in vm_config.iter().enumerate() {
             skel.maps.rodata_data.vms[i] = vm.vm_id;
         }
-
         if opts.partial {
             skel.struct_ops.rorke_mut().flags |= *compat::SCX_OPS_SWITCH_PARTIAL;
         }
-
         skel.maps.rodata_data.debug = opts.verbose as u32;
 
-        //Pin to central CPU before attaching eBPF program
-        unsafe {
-            let mut cpu_set: cpu_set_t = std::mem::zeroed();
-            CPU_SET(opts.central_cpu as usize, &mut cpu_set);
-
-            let tid: pid_t = libc::syscall(libc::SYS_gettid) as pid_t;
-
-            let result = sched_setaffinity(tid, std::mem::size_of_val(&cpu_set), &cpu_set);
-            if result != 0 {
-                return Err(anyhow!("Failed to pin to central CPU"));
-            }
-            info!("Pinned {:?} to CPU - {:?}", tid, opts.central_cpu);
-        }
-        // Load and verify the eBPF program
         let mut skel = scx_ops_load!(skel, rorke, uei)?;
 
-        // Initialize cpu_ctxs
         initialize_cpu_ctxs(&skel, &cpu_allocation)?;
 
         let struct_ops = Some(scx_ops_attach!(skel, rorke)?);
@@ -245,7 +222,7 @@ impl<'a> Scheduler<'a> {
             debug!("vm_id: {:?} vcpus: {:?}", vm.vm_id, vcpus);
 
             for vcpu in vcpus.iter() {
-                let param = sched_param { sched_priority: 0 }; // SCHED_BATCH doesn't require a priority
+                let param = sched_param { sched_priority: 0 };
                 let result = unsafe {
                     sched_setscheduler(*vcpu as i32, SCHED_EXT, &param as *const sched_param)
                 };
@@ -273,7 +250,8 @@ impl<'a> Scheduler<'a> {
             nr_kthread_dispatches: self.skel.maps.bss_data.nr_kthread_dispatches,
             nr_direct_to_idle_dispatches: self.skel.maps.bss_data.nr_direct_to_idle_dispatches,
             nr_vm_dispatches: self.skel.maps.bss_data.nr_vm_dispatches,
-            per_cpu_preempted: get_per_cpu_preempted(&self.skel).expect("Failed to get per_cpu_preempted"),
+            per_cpu_preempted: get_per_cpu_preempted(&self.skel)
+                .expect("Failed to get per_cpu_preempted"),
         }
     }
 
