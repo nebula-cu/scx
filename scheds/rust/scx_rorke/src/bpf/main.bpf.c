@@ -47,7 +47,7 @@ struct global_timer {
 
 struct {
   __uint(type, BPF_MAP_TYPE_ARRAY);
-  __uint(max_entries, 1);
+  __uint(max_entries, MAX_CPUS);
   __type(key, u32);
   __type(value, struct global_timer);
 } global_timer SEC(".maps");
@@ -162,7 +162,8 @@ void BPF_STRUCT_OPS(rorke_enqueue, struct task_struct* p, u64 enq_flags) {
 
 void BPF_STRUCT_OPS(rorke_dispatch, s32 cpu, struct task_struct* prev) {
   /* TODO: replace following with per-cpu context */
-  // trace("rorke_dispatch: CPU: %d VM: %d vCPU: %d", cpu, prev->tgid, prev->pid);
+  // trace("rorke_dispatch: CPU: %d VM: %d vCPU: %d", cpu, prev->tgid,
+  // prev->pid);
   struct cpu_ctx* cctx = try_lookup_cpu_ctx(cpu);
   // u64 now = bpf_ktime_get_ns();
 
@@ -187,6 +188,7 @@ void BPF_STRUCT_OPS(rorke_dispatch, s32 cpu, struct task_struct* prev) {
 
 void BPF_STRUCT_OPS(rorke_running, struct task_struct* p) {
   trace("rorke_running: VM: %d, vCPU: %d", p->tgid, p->pid);
+  int ret;
   u64 now = bpf_ktime_get_ns();
   s32 cpu = scx_bpf_task_cpu(p);
   struct cpu_ctx* cctx = try_lookup_cpu_ctx(cpu);
@@ -196,6 +198,19 @@ void BPF_STRUCT_OPS(rorke_running, struct task_struct* p) {
 
   cctx->last_running = now;
   __sync_fetch_and_add(&nr_running, 1);
+
+  struct bpf_timer* timer = bpf_map_lookup_elem(&global_timer, &cpu);
+  if (!timer) {
+    info("Failed to lookup timer for cpu - %d", cpu);
+    return;
+  }
+
+  ret = bpf_timer_start(timer, timer_interval_ns, BPF_F_TIMER_CPU_PIN);
+  if (ret == -EINVAL) {
+    info("Failed to pin timer for cpu - %d", cpu);
+    return;
+  }
+  info("Started timer for cpu - %d", cpu);
 }
 
 void BPF_STRUCT_OPS(rorke_stopping, struct task_struct* p, bool runnable) {
@@ -208,61 +223,59 @@ void BPF_STRUCT_OPS(rorke_stopping, struct task_struct* p, bool runnable) {
  * TODO: Add description for timer functionality
  */
 static int global_timer_fn(void* map, int* key, struct bpf_timer* timer) {
-
   u64 now = bpf_ktime_get_ns();
   s32 current_cpu = bpf_get_smp_processor_id();
-  struct cpu_ctx* cctx;
-  u64 delta;
-
-  if (timer_pinned && (current_cpu != central_cpu)) {
-    scx_bpf_error("Central Timer ran on CPU %d, not central CPU %d\n",
-                  current_cpu, central_cpu);
-    return 0;
-  }
-
-  bpf_for(current_cpu, 0, nr_cpus) {
-    if (current_cpu == central_cpu)
-      continue;
-
-    cctx = try_lookup_cpu_ctx(current_cpu);
-    if (!cctx) {
-      trace("global_timer_fn: cpu ctx lookup failed");
-      continue;
-    }
-
-    now = bpf_ktime_get_ns();
-    delta = now - cctx->last_running + 5000;
-    // if (delta < timer_interval_ns - 5000) {
-    if (delta < timer_interval_ns) {
-      trace("global_timer_fn: CPU %d ran %d (< interval - %d) ago, skipping",
-            current_cpu, delta, timer_interval_ns);
-      continue;
-    }
-//
-    if (scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | current_cpu))
-      trace("global_timer_fn: local non-empty, will kick CPU %d", current_cpu);
-    else if (scx_bpf_dsq_nr_queued(cctx->vm_id))
-      trace("global_timer_fn: VM %d queue non-empty, will kick CPU %d",
-            cctx->vm_id, current_cpu);
-    else {
-      // trace("global_timer_fn: nothing to do... skipping CPU %d", current_cpu);
-      continue;
-    }
-
-    scx_bpf_kick_cpu(current_cpu, SCX_KICK_PREEMPT);
-    cctx->preempted++;
-    trace("global_timer_fn: preempted CPU %d", current_cpu);
-  }
-
-  bpf_timer_start(timer, timer_interval_ns, BPF_F_TIMER_CPU_PIN);
-  return 0;
+  // struct cpu_ctx* cctx;
+  // u64 delta;
+  //
+  // if (timer_pinned && (current_cpu != central_cpu)) {
+  //   scx_bpf_error("Central Timer ran on CPU %d, not central CPU %d\n",
+  //                 current_cpu, central_cpu);
+  //   return 0;
+  // }
+  //
+  // bpf_for(current_cpu, 0, nr_cpus) {
+  //   if (current_cpu == central_cpu)
+  //     continue;
+  //
+  //   cctx = try_lookup_cpu_ctx(current_cpu);
+  //   if (!cctx) {
+  //     trace("global_timer_fn: cpu ctx lookup failed");
+  //     continue;
+  //   }
+  //
+  //   now = bpf_ktime_get_ns();
+  //   delta = now - cctx->last_running + 5000;
+  //   // if (delta < timer_interval_ns - 5000) {
+  //   if (delta < timer_interval_ns) {
+  //     trace("global_timer_fn: CPU %d ran %d (< interval - %d) ago, skipping",
+  //           current_cpu, delta, timer_interval_ns);
+  //     continue;
+  //   }
+  //   //
+  //   if (scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | current_cpu))
+  //     trace("global_timer_fn: local non-empty, will kick CPU %d",
+  //     current_cpu);
+  //   else if (scx_bpf_dsq_nr_queued(cctx->vm_id))
+  //     trace("global_timer_fn: VM %d queue non-empty, will kick CPU %d",
+  //           cctx->vm_id, current_cpu);
+  //   else {
+  //     // trace("global_timer_fn: nothing to do... skipping CPU %d",
+  //     // current_cpu);
+  //     continue;
+  //   }
+  //
+  //   scx_bpf_kick_cpu(current_cpu, SCX_KICK_PREEMPT);
+  //   cctx->preempted++;
+  info("global_timer_fn: preempted CPU %d", current_cpu);
+// bpf_timer_start(timer, timer_interval_ns, BPF_F_TIMER_CPU_PIN);
+return 0;
 }
 
 s32 BPF_STRUCT_OPS_SLEEPABLE(rorke_init) {
   int ret;
-
-  /* Create DSQ per VM */
   u32 i;
+
   bpf_for(i, 0, nr_vms) {
     ret = scx_bpf_create_dsq(vms[i], -1);
     if (ret) {
@@ -272,37 +285,31 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(rorke_init) {
     info("Created DSQ for VM %d", vms[i]);
   }
 
-  /* Setup timer */
   struct bpf_timer* timer;
-  u32 key = 0;
-  timer = bpf_map_lookup_elem(&global_timer, &key);
-  if (!timer) {
-    info("Failed to lookup timer");
-    return -ESRCH;
+  bpf_for(i, 0, nr_cpus) {
+    timer = bpf_map_lookup_elem(&global_timer, &i);
+    if (!timer) {
+      info("Failed to lookup timer");
+      return -ESRCH;
+    }
+    bpf_timer_init(timer, &global_timer, CLOCK_MONOTONIC);
+    bpf_timer_set_callback(timer, global_timer_fn);
+    info("Initialized timer for cpu - %d\n", i);
   }
 
-  if (bpf_get_smp_processor_id() != central_cpu) {
-    scx_bpf_error("Fatal: init on non-central CPU");
-    return EINVAL;
-  }
-
-  bpf_timer_init(timer, &global_timer, CLOCK_MONOTONIC);
-  bpf_timer_set_callback(timer, global_timer_fn);
-  info("Initialized timer\n");
-
-  ret = bpf_timer_start(timer, timer_interval_ns, BPF_F_TIMER_CPU_PIN);
+  // ret = bpf_timer_start(timer, timer_interval_ns, BPF_F_TIMER_CPU_PIN);
   /*
    * BPF_F_TIMER_CPU_PIN is not supported in all kernels (>= 6.7). If we're
    * running on an older kernel, it'll return -EINVAL
    * Retry w/o BPF_F_TIMER_CPU_PIN
    */
-  if (ret == -EINVAL) {
-    timer_pinned = false;
-    ret = bpf_timer_start(timer, timer_interval_ns, 0);
-  }
-  if (ret)
-    scx_bpf_error("bpf_timer_start failed (%d)", ret);
-  info("Started timer -- rorke_init successfully finished");
+  // if (ret == -EINVAL) {
+  //   timer_pinned = false;
+  //   ret = bpf_timer_start(timer, timer_interval_ns, 0);
+  // }
+  // if (ret)
+  //   scx_bpf_error("bpf_timer_start failed (%d)", ret);
+  // info("Started timer -- rorke_init successfully finished");
 
   return ret;
 }
