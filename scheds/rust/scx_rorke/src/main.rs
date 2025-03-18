@@ -234,7 +234,7 @@ impl<'a> Scheduler<'a> {
             }
         }
 
-        // Start stats server
+        // Start Stats server
         let stats_server = StatsServer::new(stats::server_data()).launch()?;
         Ok(Self {
             skel,
