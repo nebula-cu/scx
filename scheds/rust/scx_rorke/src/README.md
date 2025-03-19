@@ -1,0 +1,28 @@
+- `rorke_select_cpu`
+    - when a vcpu wakes up, it will call this function.
+    - if there is an idle cpu, it will pick one and directly insert to its local dsq.
+    - if there is no idle cpu, it will insert to the corresponding vm dsq.
+    - guaranteed to skip `enqueue` as we always insert to some dsq here.
+- `rorke_enqueue`
+    - it will be called, when the runnable task is being taken of the cpu.
+    - it will insert the vcpu to the corresponding vm dsq.
+    - it will check for any idle cpu and trigger scheduling cycle there.
+- `rorke_dispatch`
+    - when a pcpu is ready to schedule, it first checks its local dsq.
+        - if there is a vcpu, pcpu will run it.
+        - if local dsq is empty, pcpu will check global dsq.
+            - global dsq is not applicable in our case - not used.
+        - if both are empty, pcpu will call this function - i.e. `rorke_dispatch`
+    - based on ^, it will be only called when local dsq is empty.
+    - it will pick(dequeue) a vcpu from the vm dsq and insert into cpu's local dsq.
+- `rorke_running`
+    - it will be called right before the vcpu is being run on pcpu.
+    - it will start the timer for the pcu.
+- `rorke_stopping`
+    - it will be called right before the vcpu is being stopped on pcpu.
+
+
+- `timer_callback`
+    - it will be called when the timer expires.
+    - increases the `preempted` count for the corresponding pcpu.
+    - triggers scheduling cycle on the pcpu via `scx_bpf_kick_cpu`.
