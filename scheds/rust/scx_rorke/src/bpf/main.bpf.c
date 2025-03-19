@@ -41,7 +41,7 @@ volatile u64 nr_direct_to_idle_dispatches, nr_kthread_dispatches,
 /*
  * Timer for preempting CPUs.
  */
-struct global_timer {
+struct timer_ctx {
   struct bpf_timer timer;
 };
 
@@ -49,8 +49,8 @@ struct {
   __uint(type, BPF_MAP_TYPE_ARRAY);
   __uint(max_entries, MAX_CPUS);
   __type(key, u32);
-  __type(value, struct global_timer);
-} global_timer SEC(".maps");
+  __type(value, struct timer_ctx);
+} timers SEC(".maps");
 
 struct {
   __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
@@ -134,6 +134,7 @@ void BPF_STRUCT_OPS(rorke_enqueue, struct task_struct* p, u64 enq_flags) {
   s32 pid = p->pid;
   s32 tgid = p->tgid;
 
+  trace("rorke_enqueue: enqueued VM: %d vCPU: %d", tgid, pid);
   /*
    * Push per-cpu kthreads at the head of local dsq's and preempt the
    * corresponding CPU. This ensures that e.g. ksoftirqd isn't blocked
@@ -143,12 +144,12 @@ void BPF_STRUCT_OPS(rorke_enqueue, struct task_struct* p, u64 enq_flags) {
   if (is_kthread(p) && p->nr_cpus_allowed == 1) {
     trace("rorke_enqueue: enqueued local kthread %d", pid);
     scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_INF,
-                     enq_flags | SCX_ENQ_PREEMPT);
+                       enq_flags | SCX_ENQ_PREEMPT);
     __sync_fetch_and_add(&nr_kthread_dispatches, 1);
     return;
   }
 
-  trace("rorke_enqueue: enqueued VM: %d vCPU: %d", tgid, pid);
+  // trace("rorke_enqueue: enqueued VM: %d vCPU: %d", tgid, pid);
   scx_bpf_dsq_insert(p, tgid, SCX_SLICE_INF, enq_flags);
   __sync_fetch_and_add(&nr_vm_dispatches, 1);
 
@@ -160,7 +161,9 @@ void BPF_STRUCT_OPS(rorke_enqueue, struct task_struct* p, u64 enq_flags) {
 
 void BPF_STRUCT_OPS(rorke_dispatch, s32 cpu, struct task_struct* prev) {
   /* TODO: replace following with per-cpu context */
-  // trace("rorke_dispatch: CPU: %d VM: %d vCPU: %d", cpu, prev->tgid, prev->pid);
+  if (prev)
+    trace("rorke_dispatch: CPU: %d VM: %d vCPU: %d", cpu, prev->tgid,
+          prev->pid);
   struct cpu_ctx* cctx = try_lookup_cpu_ctx(cpu);
 
   if (!cctx)
@@ -171,7 +174,7 @@ void BPF_STRUCT_OPS(rorke_dispatch, s32 cpu, struct task_struct* prev) {
     return;
   }
 
-  if (scx_bpf_consume(vm_id)) {
+  if (scx_bpf_dsq_move_to_local(vm_id)) {
     trace("rorke_dispatch: consumed from VM - %d", vm_id);
     return;
   }
@@ -192,7 +195,7 @@ void BPF_STRUCT_OPS(rorke_running, struct task_struct* p) {
   cctx->last_running = now;
   __sync_fetch_and_add(&nr_running, 1);
 
-  struct bpf_timer* timer = bpf_map_lookup_elem(&global_timer, &cpu);
+  struct bpf_timer* timer = bpf_map_lookup_elem(&timers, &cpu);
   if (!timer) {
     info("Failed to lookup timer for cpu - %d", cpu);
     return;
@@ -217,15 +220,12 @@ void BPF_STRUCT_OPS(rorke_stopping, struct task_struct* p, bool runnable) {
  */
 static int global_timer_fn(void* map, int* key, struct bpf_timer* timer) {
   s32 current_cpu = bpf_get_smp_processor_id();
-  //
+
   struct cpu_ctx* cctx;
   cctx = try_lookup_cpu_ctx(current_cpu);
-  if (!cctx) {
-    trace("global_timer_fn: cpu ctx lookup failed");
-    return -1;
-  }
-  //
-  cctx->preempted++;
+  if (cctx)
+    cctx->preempted++;
+  scx_bpf_kick_cpu(current_cpu, SCX_KICK_PREEMPT);
   info("global_timer_fn: preempted CPU %d", current_cpu);
   return 0;
 }
@@ -245,30 +245,15 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(rorke_init) {
 
   struct bpf_timer* timer;
   bpf_for(i, 0, nr_cpus) {
-    timer = bpf_map_lookup_elem(&global_timer, &i);
+    timer = bpf_map_lookup_elem(&timers, &i);
     if (!timer) {
       info("Failed to lookup timer");
       return -ESRCH;
     }
-    bpf_timer_init(timer, &global_timer, CLOCK_MONOTONIC);
+    bpf_timer_init(timer, &timers, CLOCK_MONOTONIC);
     bpf_timer_set_callback(timer, global_timer_fn);
     info("Initialized timer for cpu - %d\n", i);
   }
-
-  // ret = bpf_timer_start(timer, timer_interval_ns, BPF_F_TIMER_CPU_PIN);
-  /*
-   * BPF_F_TIMER_CPU_PIN is not supported in all kernels (>= 6.7). If we're
-   * running on an older kernel, it'll return -EINVAL
-   * Retry w/o BPF_F_TIMER_CPU_PIN
-   */
-  // if (ret == -EINVAL) {
-  //   timer_pinned = false;
-  //   ret = bpf_timer_start(timer, timer_interval_ns, 0);
-  // }
-  // if (ret)
-  //   scx_bpf_error("bpf_timer_start failed (%d)", ret);
-  // info("Started timer -- rorke_init successfully finished");
-
   return ret;
 }
 
@@ -284,7 +269,7 @@ SCX_OPS_DEFINE(rorke,
                 * anything special. Enqueue the last tasks like any other tasks.
                 */
 
-               .flags = SCX_OPS_ENQ_LAST,
+               // .flags = SCX_OPS_ENQ_LAST,
                .select_cpu = (void*)rorke_select_cpu,
                .enqueue = (void*)rorke_enqueue,
                .dispatch = (void*)rorke_dispatch,
