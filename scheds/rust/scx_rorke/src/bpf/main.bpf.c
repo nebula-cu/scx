@@ -27,7 +27,6 @@ UEI_DEFINE(uei);
  * Following are parameters to scheduler and  set again during initialization.
  * Here we assign values just to pass the verifier.
  */
-const volatile u32 central_cpu = 0;
 const volatile u32 nr_cpus = 1;
 const volatile u32 nr_vms = 1;
 const volatile u64 timer_interval_ns = 100000;
@@ -91,7 +90,6 @@ s32 BPF_STRUCT_OPS(rorke_select_cpu,
   s32 cpu;
   s32 pid = p->pid;
   s32 tgid = p->tgid;
-
   trace("rorke_select_cpu: VM: %d, vCPU: %d, prev_cpu: %d", tgid, pid,
         prev_cpu);
 
@@ -102,27 +100,28 @@ s32 BPF_STRUCT_OPS(rorke_select_cpu,
     dbg("rorke_select_cpu: VM: %d, vCPU: %d, prev_cpu: %d direct dispatch to "
         "idle cpu: %d",
         p->tgid, p->pid, prev_cpu, cpu);
-
     return cpu;
   }
 
   dbg("rorke_enqueue: enqueued VM: %d vCPU: %d", tgid, pid);
   scx_bpf_dsq_insert(p, tgid, SCX_SLICE_INF, 0);
   __sync_fetch_and_add(&nr_vm_dispatches, 1);
-
   return prev_cpu;
 }
 
 /*
  * Wake up an idle CPU for task @p.
+ * It triggers scheduling cycle there.
  */
 static void kick_task_cpu(struct task_struct* p) {
   s32 cpu = scx_bpf_task_cpu(p);
-
   cpu = pick_idle_cpu(p, cpu, 0);
-  if (cpu >= 0)
+
+  if (cpu >= 0) {
     scx_bpf_kick_cpu(cpu, 0);
-  else
+    trace("kick_task_cpu: woke up CPU: %d for VM: %d, vCPU: %d", cpu, p->tgid,
+          p->pid);
+  } else
     trace("kick_task_cpu: no idle CPU for VM: %d, vCPU: %d", p->tgid, p->pid);
 }
 
@@ -134,7 +133,6 @@ void BPF_STRUCT_OPS(rorke_enqueue, struct task_struct* p, u64 enq_flags) {
   s32 pid = p->pid;
   s32 tgid = p->tgid;
 
-  trace("rorke_enqueue: enqueued VM: %d vCPU: %d", tgid, pid);
   /*
    * Push per-cpu kthreads at the head of local dsq's and preempt the
    * corresponding CPU. This ensures that e.g. ksoftirqd isn't blocked
@@ -149,8 +147,8 @@ void BPF_STRUCT_OPS(rorke_enqueue, struct task_struct* p, u64 enq_flags) {
     return;
   }
 
-  // trace("rorke_enqueue: enqueued VM: %d vCPU: %d", tgid, pid);
   scx_bpf_dsq_insert(p, tgid, SCX_SLICE_INF, enq_flags);
+  trace("rorke_enqueue: enqueued VM: %d vCPU: %d", tgid, pid);
   __sync_fetch_and_add(&nr_vm_dispatches, 1);
 
   /*
@@ -160,12 +158,11 @@ void BPF_STRUCT_OPS(rorke_enqueue, struct task_struct* p, u64 enq_flags) {
 }
 
 void BPF_STRUCT_OPS(rorke_dispatch, s32 cpu, struct task_struct* prev) {
-  /* TODO: replace following with per-cpu context */
   if (prev)
     trace("rorke_dispatch: CPU: %d VM: %d vCPU: %d", cpu, prev->tgid,
           prev->pid);
-  struct cpu_ctx* cctx = try_lookup_cpu_ctx(cpu);
 
+  struct cpu_ctx* cctx = try_lookup_cpu_ctx(cpu);
   if (!cctx)
     return;
 
@@ -178,35 +175,28 @@ void BPF_STRUCT_OPS(rorke_dispatch, s32 cpu, struct task_struct* prev) {
     trace("rorke_dispatch: consumed from VM - %d", vm_id);
     return;
   }
-
-  dbg("rorke_dispatch: empty... didn't consumed from VM - %d", vm_id);
+  dbg("rorke_dispatch: VM-%d queue empty...", vm_id);
 }
 
 void BPF_STRUCT_OPS(rorke_running, struct task_struct* p) {
   trace("rorke_running: VM: %d, vCPU: %d", p->tgid, p->pid);
-  int ret;
-  u64 now = bpf_ktime_get_ns();
-  s32 cpu = scx_bpf_task_cpu(p);
-  struct cpu_ctx* cctx = try_lookup_cpu_ctx(cpu);
-
-  if (!cctx)
-    return;
-
-  cctx->last_running = now;
   __sync_fetch_and_add(&nr_running, 1);
 
+  /* Start the timer for the CPU */
+
+  s32 cpu = scx_bpf_task_cpu(p);
   struct bpf_timer* timer = bpf_map_lookup_elem(&timers, &cpu);
   if (!timer) {
-    info("Failed to lookup timer for cpu - %d", cpu);
+    scx_bpf_error("Failed to lookup timer for cpu - %d", cpu);
     return;
   }
 
-  ret = bpf_timer_start(timer, timer_interval_ns, BPF_F_TIMER_CPU_PIN);
+  int ret = bpf_timer_start(timer, timer_interval_ns, BPF_F_TIMER_CPU_PIN);
   if (ret == -EINVAL) {
-    info("Failed to pin timer for cpu - %d", cpu);
+    scx_bpf_error("Failed to pin timer for cpu - %d", cpu);
     return;
   }
-  info("Started timer for cpu - %d", cpu);
+  trace("Started timer for cpu - %d", cpu);
 }
 
 void BPF_STRUCT_OPS(rorke_stopping, struct task_struct* p, bool runnable) {
@@ -215,18 +205,16 @@ void BPF_STRUCT_OPS(rorke_stopping, struct task_struct* p, bool runnable) {
   __sync_fetch_and_sub(&nr_running, 1);
 }
 
-/*
- * TODO: Add description for timer functionality
- */
-static int global_timer_fn(void* map, int* key, struct bpf_timer* timer) {
-  s32 current_cpu = bpf_get_smp_processor_id();
-
+static int timer_callback(void* map, int* key, struct bpf_timer* timer) {
   struct cpu_ctx* cctx;
+
+  s32 current_cpu = bpf_get_smp_processor_id();
   cctx = try_lookup_cpu_ctx(current_cpu);
   if (cctx)
     cctx->preempted++;
+
   scx_bpf_kick_cpu(current_cpu, SCX_KICK_PREEMPT);
-  info("global_timer_fn: preempted CPU %d", current_cpu);
+  trace("timer_callback: preempted CPU %d", current_cpu);
   return 0;
 }
 
@@ -237,22 +225,22 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(rorke_init) {
   bpf_for(i, 0, nr_vms) {
     ret = scx_bpf_create_dsq(vms[i], -1);
     if (ret) {
-      scx_bpf_error("Failed to create DSQ for VM %lld", vms[i]);
+      scx_bpf_error("rorke_init: failed to create dsq for VM-%lld", vms[i]);
       return ret;
     }
-    info("Created DSQ for VM %d", vms[i]);
+    info("rorke_init: created dsq for VM-%d", vms[i]);
   }
 
   struct bpf_timer* timer;
   bpf_for(i, 0, nr_cpus) {
     timer = bpf_map_lookup_elem(&timers, &i);
     if (!timer) {
-      info("Failed to lookup timer");
+      scx_bpf_error("rorke_init: failed to lookup timer");
       return -ESRCH;
     }
     bpf_timer_init(timer, &timers, CLOCK_MONOTONIC);
-    bpf_timer_set_callback(timer, global_timer_fn);
-    info("Initialized timer for cpu - %d\n", i);
+    bpf_timer_set_callback(timer, timer_callback);
+    info("rorke_init: initialized timer for cpu - %d\n", i);
   }
   return ret;
 }
