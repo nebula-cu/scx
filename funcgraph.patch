@@ -1,0 +1,23 @@
+diff --git a/kernel/funcgraph b/kernel/funcgraph
+index b796e33..036987b 100755
+--- a/kernel/funcgraph
++++ b/kernel/funcgraph
+@@ -66,7 +66,7 @@
+ # 12-Jul-2014	Brendan Gregg	Created this.
+ 
+ ### default variables
+-tracing=/sys/kernel/debug/tracing
++tracing=/sys/kernel/tracing
+ flock=/var/tmp/.ftrace-lock
+ opt_duration=0; duration=; opt_pid=0; pid=; opt_tid=0; tid=; pidtext=
+ opt_headers=0; opt_proc=0; opt_time=0; opt_tail=0; opt_nodur=0; opt_cpu=0
+@@ -241,7 +241,9 @@ if (( opt_nodur )); then
+ fi
+ 
+ ### print trace buffer
++echo "Clearing relics of trace"
+ warn "echo > trace"
++warn "echo 1 > tracing_on"
+ if (( opt_duration )); then
+ 	sleep $duration
+ 	if (( opt_headers )); then
