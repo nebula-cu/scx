@@ -1,0 +1,38 @@
+diff --git a/kernel/sched/ext.c b/kernel/sched/ext.c
+index 7b9dfee858e7..41aad0445042 100644
+--- a/kernel/sched/ext.c
++++ b/kernel/sched/ext.c
+@@ -6,6 +6,9 @@
+  * Copyright (c) 2022 Tejun Heo <tj@kernel.org>
+  * Copyright (c) 2022 David Vernet <dvernet@meta.com>
+  */
++#include "linux/irq_work.h"
++#include "linux/irqflags.h"
++#include "linux/smp.h"
+ #define SCX_OP_IDX(op)		(offsetof(struct sched_ext_ops, op) / sizeof(void (*)(void)))
+ 
+ enum scx_consts {
+@@ -595,8 +598,6 @@ struct sched_ext_ops {
+ 	 */
+ 	void (*cgroup_move)(struct task_struct *p,
+ 			    struct cgroup *from, struct cgroup *to);
+-
+-	/**
+ 	 * @cgroup_cancel_move: Cancel cgroup move
+ 	 * @p: task whose cgroup move is being canceled
+ 	 * @from: cgroup @p was being moved from
+@@ -7069,6 +7070,14 @@ __bpf_kfunc void scx_bpf_kick_cpu(s32 cpu, u64 flags)
+ 	if (scx_rq_bypassing(this_rq))
+ 		goto out;
+ 
++	if ((flags & SCX_KICK_PREEMPT) && (cpu == smp_processor_id()) {
++		raw_spin_rq_lock(this_rq);
++		this_rq->curr->scx.slice = 0;
++		resched_curr(this_rq);
++		raw_spin_rq_unlock(this_rq);
++		goto out;
++	}
++
+ 	/*
+ 	 * Actual kicking is bounced to kick_cpus_irq_workfn() to avoid nesting
+ 	 * rq locks. We can probably be smarter and avoid bouncing if called
