@@ -1,4 +1,4 @@
-<domain type='kvm' id='4'>
+<domain type='kvm' id='3'>
   <name>vm1</name>
   <uuid>b66b78f5-6f1e-4006-9bf6-c8700f5bf8ca</uuid>
   <metadata>
@@ -10,10 +10,10 @@
   <currentMemory unit='KiB'>16777216</currentMemory>
   <vcpu placement='static'>4</vcpu>
   <cputune>
-    <vcpupin vcpu='0' cpuset='1-2'/>
-    <vcpupin vcpu='1' cpuset='1-2'/>
-    <vcpupin vcpu='2' cpuset='1-2'/>
-    <vcpupin vcpu='3' cpuset='1-2'/>
+    <vcpupin vcpu='0' cpuset='0-1'/>
+    <vcpupin vcpu='1' cpuset='0-1'/>
+    <vcpupin vcpu='2' cpuset='0-1'/>
+    <vcpupin vcpu='3' cpuset='0-1'/>
   </cputune>
   <resource>
     <partition>/machine</partition>
@@ -45,7 +45,7 @@
     <emulator>/usr/bin/qemu-system-x86_64</emulator>
     <disk type='file' device='disk'>
       <driver name='qemu' type='qcow2'/>
-            <source file='/users/vj2267/virt/images/vm1.img' index='1'/>
+      <source file='/users/vj2267/virt/images/vm1.img' index='1'/>
       <backingStore/>
       <target dev='vda' bus='virtio'/>
       <alias name='virtio-disk0'/>
@@ -152,26 +152,26 @@
     </controller>
     <interface type='network'>
       <mac address='52:54:00:eb:e7:08'/>
-      <source network='default' portid='52e87d58-aca9-4c60-b1aa-636afa3a80f7' bridge='virbr0'/>
+      <source network='default' portid='91b7de5e-8350-423c-a682-aab8c6a94e6e' bridge='virbr0'/>
       <target dev='vnet3'/>
       <model type='virtio'/>
       <alias name='net0'/>
       <address type='pci' domain='0x0000' bus='0x06' slot='0x00' function='0x0'/>
     </interface>
     <serial type='pty'>
-      <source path='/dev/pts/2'/>
+      <source path='/dev/pts/3'/>
       <target type='isa-serial' port='0'>
         <model name='isa-serial'/>
       </target>
       <alias name='serial0'/>
     </serial>
-    <console type='pty' tty='/dev/pts/2'>
-      <source path='/dev/pts/2'/>
+    <console type='pty' tty='/dev/pts/3'>
+      <source path='/dev/pts/3'/>
       <target type='serial' port='0'/>
       <alias name='serial0'/>
     </console>
     <channel type='unix'>
-      <source mode='bind' path='/run/libvirt/qemu/channel/4-vm1/org.qemu.guest_agent.0'/>
+      <source mode='bind' path='/run/libvirt/qemu/channel/3-vm1/org.qemu.guest_agent.0'/>
       <target type='virtio' name='org.qemu.guest_agent.0' state='disconnected'/>
       <alias name='channel0'/>
       <address type='virtio-serial' controller='0' bus='0' port='1'/>
@@ -201,8 +201,8 @@
     <imagelabel>libvirt-b66b78f5-6f1e-4006-9bf6-c8700f5bf8ca</imagelabel>
   </seclabel>
   <seclabel type='dynamic' model='dac' relabel='yes'>
-    <label>+64055:+993</label>
-    <imagelabel>+64055:+993</imagelabel>
+    <label>+64055:+994</label>
+    <imagelabel>+64055:+994</imagelabel>
   </seclabel>
 </domain>
 
