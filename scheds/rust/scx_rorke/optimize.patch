@@ -1,0 +1,19 @@
+diff --git a/kernel/sched/ext.c b/kernel/sched/ext.c
+index 7b9dfee858e7..e11e00caa90c 100644
+--- a/kernel/sched/ext.c
++++ b/kernel/sched/ext.c
+@@ -7069,6 +7069,14 @@ __bpf_kfunc void scx_bpf_kick_cpu(s32 cpu, u64 flags)
+ 	if (scx_rq_bypassing(this_rq))
+ 		goto out;
+ 
++	if ((flags & SCX_KICK_PREEMPT) && (cpu == smp_processor_id())) {
++		raw_spin_rq_lock(this_rq);
++		this_rq->curr->scx.slice = 0;
++		resched_curr(this_rq);
++		raw_spin_rq_unlock(this_rq);
++		goto out;
++	}
++
+ 	/*
+ 	 * Actual kicking is bounced to kick_cpus_irq_workfn() to avoid nesting
+ 	 * rq locks. We can probably be smarter and avoid bouncing if called
