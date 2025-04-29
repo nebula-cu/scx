@@ -39,6 +39,7 @@ use scx_stats::prelude::*;
 use scx_utils::build_id;
 use scx_utils::compat;
 use scx_utils::import_enums;
+use scx_utils::init_libbpf_logging;
 use scx_utils::scx_enums;
 use scx_utils::scx_ops_attach;
 use scx_utils::scx_ops_load;
@@ -47,7 +48,6 @@ use scx_utils::set_rlimit_infinity;
 use scx_utils::uei_exited;
 use scx_utils::uei_report;
 use scx_utils::UserExitInfo;
-use scx_utils::init_libbpf_logging;
 
 const SCHED_EXT: i32 = 7;
 const SCHEDULER_NAME: &'static str = "scx_rorke";
@@ -185,8 +185,6 @@ impl<'a> Scheduler<'a> {
         );
         info!("Opts: {:?}", opts);
         let mut skel = scx_ops_open!(skel_builder, open_object, rorke).unwrap();
-
-
 
         // Parse json config file
         let config_path = match &opts.config_file {
