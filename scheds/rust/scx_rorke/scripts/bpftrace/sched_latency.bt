@@ -1,0 +1,60 @@
+#!/usr/bin/env bpftrace
+
+/*
+ * sched_latency.bt
+ *
+ * This BPFtrace script measures the latency of scheduling decisions in the Linux kernel.
+ *
+ * Usage:
+ *   sudo ./sched_latency.bt <cpu> <interval_seconds>
+ *
+ * Example:
+ *   sudo bpftrace sched_latency.bt 0 1
+ *
+ * This will measure scheduling latency on CPU 0 and print results every 1 second.
+ * Note: Requires root privileges to run.
+*/
+
+BEGIN
+{
+    printf("Measuring scheduling decision latency... Hit Ctrl-C to end.\n");
+}
+
+fentry:schedule
+/cpu == $1/
+{
+    @start[pid] = nsecs;
+}
+
+tracepoint:sched:sched_switch
+/cpu == $1/
+{
+    if(!@start[pid]){
+        return;
+    }
+
+    $duration = (nsecs - @start[pid]);
+
+    @max_ns[args.prev_comm, args.next_comm] = max($duration);
+    @latency_stats_ns[args.prev_comm, args.next_comm] = stats($duration);
+}
+
+interval:s:$2
+{
+    time("%H:%M:%S\n");
+    print("--- Max Latency ---");
+    print(@max_ns);
+    print("--- Latency Stats ---");
+    print(@latency_stats_ns);
+
+    clear(@start);
+    clear(@max_ns);
+    clear(@latency_stats_ns);
+}
+
+END
+{
+    clear(@start);
+    clear(@max_ns);
+    clear(@latency_stats_ns);
+}

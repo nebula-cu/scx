@@ -1,0 +1,49 @@
+#!/usr/bin/env bpftrace
+
+/*
+ * Note: Requires root privileges to run.
+*/
+
+BEGIN
+{
+    printf("Measuring VMCS switch latency... Hit Ctrl-C to end.\n");
+}
+
+fentry:kvm_intel:vmx_vcpu_put
+/cpu == $1/
+{
+    @start[comm] = nsecs;
+}
+
+fexit:kvm_intel:vmx_vcpu_put
+/cpu == $1/
+{
+    if(!@start[comm]) {
+        return;
+    }
+
+    $duration = (nsecs - @start[comm]);
+
+    @max_ns[comm] = max($duration);
+    @latency_stats_ns[comm] = stats($duration);
+}
+
+interval:s:$2
+{
+    time("%H:%M:%S\n");
+    print("--- Max Latency ---");
+    print(@max_ns);
+    print("--- Latency Stats ---");
+    print(@latency_stats_ns);
+
+    clear(@start);
+    clear(@max_ns);
+    clear(@latency_stats_ns);
+}
+
+END
+{
+    clear(@start);
+    clear(@max_ns);
+    clear(@latency_stats_ns);
+}

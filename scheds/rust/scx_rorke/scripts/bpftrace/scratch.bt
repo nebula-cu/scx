@@ -1,0 +1,15 @@
+fentry:vmx_vcpu_put
+/cpu == 0/
+{
+    $now = nsecs;
+    print($now);
+    print(kstack);
+}
+
+fentry:vmx_vcpu_load
+/cpu == 0/
+{
+    $now = nsecs;
+    print($now);
+    print(kstack);
+}

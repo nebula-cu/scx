@@ -1,0 +1,48 @@
+
+BEGIN
+{
+    printf("Tracing schedule() to context_switch() latency...\n");
+    printf("Hit Ctrl-C to end tracing.\n");
+}
+
+kprobe:schedule
+{
+    // Store the timestamp (in nanoseconds) when schedule is entered
+    // Key the map by CPU to handle per-CPU scheduling
+    if (cpu == 0){
+        @start_time[cpu] = nsecs;
+    }
+}
+
+tracepoint:sched:sched_switch
+{
+    if (cpu==0) {
+        // Get the current timestamp
+        $end_time = nsecs;
+
+        // Lookup the start time for this CPU
+        $start_time = @start_time[cpu];
+
+        // If a start time was recorded for this CPU
+        if ($start_time) {
+            // Calculate the duration in nanoseconds
+            $duration = $end_time - $start_time;
+
+            // Store the duration in a histogram map (e.g., in microseconds)
+            @latency_us = hist($duration / 1000);
+
+            // Optional: print each event (can be very noisy on a busy system)
+            // printf("CPU %d: schedule -> context_switch latency: %lld ns\n", cpu, cpu, $duration);
+
+            // Clean up the start time for this CPU
+            delete(@start_time[cpu]);
+        }
+    }
+}
+
+END
+{
+    clear(@start_time);
+    printf("\nTracing finished. Schedule decision latency histogram (us):\n");
+//    print(@latency_us);
+}

@@ -1,0 +1,84 @@
+BEGIN
+{
+    printf("Tracing schedule() to context_switch() latency on CPU 0 only...\n");
+    printf("Calculating average latency and script runtime...\n");
+    printf("Hit Ctrl-C to end tracing.\n");
+    @start_script_time = nsecs; // Record script start time
+}
+
+kprobe:schedule
+{
+    // Check if the current CPU is 0
+    if (cpu == 0) {
+        // Store the timestamp (in nanoseconds) when schedule is entered
+        // Key the map by CPU (though we only expect CPU 0 here)
+        @start_time[cpu] = nsecs;
+    }
+}
+
+tracepoint:sched:sched_switch
+{
+    // Check if the current CPU is 0
+    if (cpu == 0) {
+        // Get the current timestamp
+        $end_time = nsecs;
+
+        // Lookup the start time for this CPU (CPU 0)
+        $start_time = @start_time[cpu];
+
+        // If a start time was recorded for this CPU (CPU 0)
+        if ($start_time) {
+            // Calculate the duration in nanoseconds
+            $duration = $end_time - $start_time;
+
+            // Accumulate total duration for average calculation
+            // Corrected: use += for summing
+            @total_duration[cpu] += $duration;
+
+            // Count events for average calculation
+            // Corrected: count() is an aggregation, use @map = count() or increment a counter
+            @event_count[cpu]++; // Increment event count for this CPU
+
+            // Optional: print each event (can still be very noisy)
+            // printf("CPU %d: schedule -> context_switch latency: %lld ns\n", cpu, cpu, $duration);
+
+            // Clean up the start time for this CPU
+            delete(@start_time[cpu]);
+        }
+    }
+}
+
+END
+{
+    printf("\nTracing finished.\n");
+
+    // Calculate and print average latency for CPU 0
+    $total_dur_cpu0 = @total_duration[0];
+    $event_cnt_cpu0 = @event_count[0];
+
+    if ($event_cnt_cpu0 > 0) {
+        // Calculate average latency in nanoseconds
+        $average_latency_ns = $total_dur_cpu0 / $event_cnt_cpu0;
+        // Print in nanoseconds and microseconds (using integer division for us)
+        printf("Average schedule decision latency on CPU 0: %lld ns (%lld us)\n",
+               $average_latency_ns, $average_latency_ns / 1000);
+    } else {
+        printf("No schedule -> context_switch events recorded on CPU 0.\n");
+    }
+
+    // Calculate and print script runtime
+    $runtime_ns = nsecs - @start_script_time;
+    $runtime_sec = $runtime_ns / 1e9; // Convert nanoseconds to seconds
+    $runtime_min = $runtime_sec / 60.0;
+
+    if ($runtime_min >= 1.0) {
+        printf("Script runtime: %.2f minutes\n", $runtime_min);
+    } else {
+        printf("Script runtime: %.3f seconds\n", $runtime_sec);
+    }
+
+    // Clean up maps
+    clear(@start_time);
+    clear(@total_duration);
+    clear(@event_count);
+}

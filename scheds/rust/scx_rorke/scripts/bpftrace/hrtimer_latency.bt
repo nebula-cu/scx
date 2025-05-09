@@ -1,0 +1,56 @@
+#!/usr/bin/env bpftrace
+
+/*
+ * Note: Requires root privileges to run.
+*/
+
+BEGIN
+{
+    printf("Measuring hrtimer IRQ handling latency... Hit Ctrl-C to end.\n");
+}
+
+tracepoint:timer:hrtimer_expire_entry
+/cpu == $1/
+{
+    @start[comm, ksym(args.function)] = nsecs;
+    @fn_name[comm, args.hrtimer] = args.function;
+}
+
+tracepoint:timer:hrtimer_expire_exit
+/cpu == $1/
+{
+
+    $name = ksym(@fn_name[comm, args.hrtimer]);
+
+    if(!@start[comm, $name]) {
+        return;
+    }
+
+    $duration = (nsecs - @start[comm, $name]);
+
+    @max_ns[comm, $name] = max($duration);
+    @latency_stats_ns[comm, $name] = stats($duration);
+}
+
+interval:s:$2
+{
+    time("%H:%M:%S\n");
+    print("--- Max Latency ---");
+    print(@max_ns);
+    print("--- Latency Stats ---");
+    print(@latency_stats_ns);
+
+    clear(@start);
+    clear(@max_ns);
+    clear(@latency_stats_ns);
+}
+
+END
+{
+    clear(@start);
+    clear(@max_ns);
+    clear(@latency_stats_ns);
+    clear(@fn_name);
+}
+
+
