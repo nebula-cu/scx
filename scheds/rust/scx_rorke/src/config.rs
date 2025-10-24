@@ -3,8 +3,8 @@ use serde_json::Result;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct VMConfig {
-	pub vm_name: String,
-	pub vm_id: u64,
+    pub vm_name: String,
+    pub vm_id: u64,
     pub vcpus: Vec<u64>,
 }
 
@@ -133,4 +133,3 @@ mod tests {
         assert_eq!(cpu_allocation, expected_allocation);
     }
 }
-
