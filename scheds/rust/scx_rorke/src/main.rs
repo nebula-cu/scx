@@ -17,6 +17,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
+use std::process::Command;
 use libc::{sched_param, sched_setscheduler};
 
 use anyhow::anyhow;
@@ -224,17 +225,52 @@ impl<'a> Scheduler<'a> {
             let vcpus = &vm.vcpus;
             debug!("vm_id: {:?} vcpus: {:?}", vm.vm_id, vcpus);
 
-            for vcpu in vcpus.iter() {
-                let param = sched_param { sched_priority: 0 };
+			// pCPUs assigned to this VM
+            let pcpus_str = cpu_allocation.iter()
+                .enumerate()
+                .filter_map(|(pcpu, owner)| {
+                    if *owner == vm.vm_id as u64 {
+                        Some(pcpu.to_string())
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+
+			if pcpus_str.is_empty() {
+				return Err(anyhow!("No pCPUs allocated for vm_id {:?}", vm.vm_id));
+			}
+
+			for (vcpu_idx, vcpu_pid) in vcpus.iter().enumerate() {
+				let param = sched_param { sched_priority: 0 };
                 let result = unsafe {
-                    sched_setscheduler(*vcpu as i32, SCHED_EXT, &param as *const sched_param)
+                    sched_setscheduler(*vcpu_pid as i32, SCHED_EXT, &param as *const sched_param)
                 };
 
                 if result == -1 {
-                    return Err(anyhow!("Failed to set SCHED_EXT for vcpu: {:?}", vcpu));
+                    return Err(anyhow!("Failed to set SCHED_EXT for vcpu: {:?}", vcpu_pid));
                 }
-                debug!("Set SCHED_EXT for vcpu: {:?}", vcpu);
-            }
+                debug!("Set SCHED_EXT for vcpu: {:?}", vcpu_pid);
+
+				let status = Command::new("virsh")
+                       .arg("vcpupin")
+                       .arg(vm.vm_name.clone())
+                       .arg(vcpu_idx.to_string())
+                       .arg(&pcpus_str)
+                       .stdout(std::process::Stdio::null()) // Suppress terminal output
+                       .status()
+                       .context("failed to execute virsh vcpupin")?;
+
+				if !status.success() {
+					return Err(anyhow!(
+						"failed to pin vcpu for vm_id {:?} vcpu {} (pcpus={})",
+						vm.vm_id,
+						vcpu_idx,
+						pcpus_str
+					));
+				}
+			}
         }
 
         // Start Stats server
@@ -342,3 +378,4 @@ fn main() -> Result<()> {
 
     Ok(())
 }
+

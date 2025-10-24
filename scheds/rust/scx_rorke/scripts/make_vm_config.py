@@ -90,10 +90,11 @@ def main():
 
         vcpu_pids = get_vcpu_pids(vm_name, vm_pid)
 
-        output.append({"vm_id": vm_pid, "vcpus": vcpu_pids})
+        output.append({"vm_name": vm_name, "vm_id": vm_pid, "vcpus": vcpu_pids})
 
     print(json.dumps(output, indent=4))
 
 
 if __name__ == "__main__":
     main()
+
