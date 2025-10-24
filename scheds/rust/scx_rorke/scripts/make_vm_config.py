@@ -14,7 +14,7 @@ def get_vm_pid(vm_name):
             cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True
         )
         for line in result.stdout.strip().split("\n"):
-            if vm_name in line:
+            if f"-name guest={vm_name}," in line:
                 pid = int(line.strip().split()[0])
                 return pid
     except subprocess.CalledProcessError as e:
