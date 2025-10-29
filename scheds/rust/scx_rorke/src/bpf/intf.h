@@ -32,6 +32,11 @@ enum consts {
   MAX_VMS = 16,
 };
 
+struct sched_data {
+	u64 instr;
+	u64 cycles;
+};
+
 /*
  * Per-CPU context.
  */
@@ -39,6 +44,7 @@ struct cpu_ctx {
   u64 last_running;
   u64 preempted;
   u64 vm_id;
+  struct sched_data data;
 };
 
 #endif /* __INTF_H */

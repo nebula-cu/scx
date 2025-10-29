@@ -169,11 +169,23 @@ fn initialize_cpu_ctxs(skel: &BpfSkel, cpu_allocation: &Vec<u64>) -> Result<()> 
     Ok(())
 }
 
+struct SchedMetric {
+    name: String, // human-readable label
+    config: u64, // what to count, e.g. PERF_COUNT_HW_INSTRUCTIONS
+    sample_period: u64, // perf event is triggered every sample_period counts
+    prog_fd: i32, // fd of the BPF program to attach
+	link_fds: Vec<i32>, // fds of the perf event link, closed on drop
+}
+
+fn prog_fd<P: AsFd>(prog: &P) -> i32 {
+    prog.as_fd().as_raw_fd()
+}
+
 struct Scheduler<'a> {
     skel: BpfSkel<'a>,
     struct_ops: Option<libbpf_rs::Link>,
     stats_server: StatsServer<(), Metrics>,
-    perf_links: Vec<i32>,
+    sched_metrics: Vec<SchedMetric>,
 }
 
 impl<'a> Scheduler<'a> {
@@ -219,47 +231,62 @@ impl<'a> Scheduler<'a> {
 
         let mut skel = scx_ops_load!(skel, rorke, uei)?;
 
-        let mut perf_links = Vec::<i32>::new();
+		// This needs to be initalized after skel is loaded to get valid prog fds
+		let mut sched_metrics: Vec<SchedMetric> = vec![
+			SchedMetric {
+				name: "instructions".to_string(),
+				config: sys::bindings::PERF_COUNT_HW_INSTRUCTIONS as u64,
+				sample_period: 1_000,
+				prog_fd: prog_fd(&skel.progs.count_instr),
+				link_fds: vec![],
+			},
+			SchedMetric {
+				name: "cycles".to_string(),
+				config: sys::bindings::PERF_COUNT_HW_CPU_CYCLES as u64,
+				sample_period: 1_000,
+				prog_fd: prog_fd(&skel.progs.count_cycles),
+				link_fds: vec![],
+			},
+		];
+
         for cpu in 0..opts.num_cpus {
-            let mut attrs = sys::bindings::perf_event_attr::default();
-            attrs.size = std::mem::size_of::<sys::bindings::perf_event_attr>() as u32;
-            attrs.type_ = sys::bindings::PERF_TYPE_HARDWARE;
-            attrs.set_disabled(1);
-            attrs.set_exclude_kernel(1);
-            attrs.set_exclude_hv(1);
-			attrs.__bindgen_anon_1.sample_period = 100; // perf event triggers every sample_period instructions
-			attrs.config = sys::bindings::PERF_COUNT_HW_INSTRUCTIONS as u64;
+			for metric in sched_metrics.iter_mut() {
+				let mut attrs = sys::bindings::perf_event_attr::default();
+				attrs.size = std::mem::size_of::<sys::bindings::perf_event_attr>() as u32;
+				attrs.type_ = sys::bindings::PERF_TYPE_HARDWARE;
+				attrs.set_disabled(1);
+				attrs.set_exclude_kernel(1);
+				attrs.set_exclude_hv(1);
+				attrs.config = metric.config;
+				attrs.__bindgen_anon_1.sample_period = metric.sample_period;
+				let perf_fd = unsafe {
+					sys::perf_event_open(&mut attrs, -1, cpu as i32, -1, 0)
+				};
+				if perf_fd < 0 {
+					return Err(anyhow!("Cannot open perf event for pcpu {:?} metric {:?}", cpu, metric.name));
+				}
+				// Create link between perf event and BPF program
+				let link_fd = unsafe {
+					libbpf_sys::bpf_link_create(
+						metric.prog_fd,
+						perf_fd,
+						libbpf_sys::BPF_PERF_EVENT as u32,
+						std::ptr::null(),
+					)
+				};
+				if link_fd < 0 {
+					return Err(anyhow!("Failed to create perf event link for CPU {} metric {:?}", cpu, metric.name));
+				}
+				// Enable the perf event
+				let enable_rc = unsafe {
+					libc::ioctl(perf_fd, 0x2400, 0)
+				};
+				if enable_rc != 0 {
+					return Err(anyhow!("Failed to enable perf event for CPU {} metric {:?}", cpu, metric.name));
+				}
 
-            let perf_fd = unsafe {
-                sys::perf_event_open(&mut attrs, -1, cpu as i32, -1, 0)
-            };
-            if perf_fd < 0 {
-                return Err(anyhow!("Cannot open perf instructions event for pcpu {:?}", cpu));
-            }
-			// Fd of the BPF program to attach
-            let prog_fd = skel.progs.on_perf_event.as_fd().as_raw_fd();
-            // Create link between perf event and BPF program
-            let link_fd = unsafe {
-                libbpf_sys::bpf_link_create(
-                    prog_fd,
-                    perf_fd,
-                    libbpf_sys::BPF_PERF_EVENT as u32,
-                    std::ptr::null(),
-                )
-            };
-            if link_fd < 0 {
-                return Err(anyhow!("Failed to create perf event link for CPU {}", cpu));
-            }
-
-			// Enable the perf event
-            let enable_rc = unsafe {
-                libc::ioctl(perf_fd, 0x2400, 0)
-            };
-            if enable_rc != 0 {
-                return Err(anyhow!("Failed to enable perf event for CPU {}", cpu));
-            }
-
-            perf_links.push(link_fd);
+				metric.link_fds.push(link_fd);
+			}
         }
 
         initialize_cpu_ctxs(&skel, &cpu_allocation)?;
@@ -327,7 +354,7 @@ impl<'a> Scheduler<'a> {
             skel,
             struct_ops,
             stats_server,
-            perf_links,
+			sched_metrics,
         })
     }
 
@@ -368,11 +395,13 @@ impl<'a> Drop for Scheduler<'a> {
         info!("Unregister {} scheduler", SCHEDULER_NAME);
         
         // Clean up perf links
-        for &link_fd in self.perf_links.iter() {
-            unsafe {
-                libc::close(link_fd);
-            }
-        }
+		for metric in self.sched_metrics.iter() {
+			for link_fd in metric.link_fds.iter() {
+				unsafe {
+					libc::close(*link_fd);
+				}
+			}
+		}
     }
 }
 
