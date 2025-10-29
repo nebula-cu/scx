@@ -1841,6 +1841,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19b17cddbe7ec3f8bc800887bab5e717348c95ea2ca0b1bf0837fb964dc67099"
 
 [[package]]
+name = "perf-event-open-sys"
+version = "5.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "53fa97b8f69404e792c384914dbe6ffc298586cca534e1c1c410e02f7cd13cfe"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "perf-event-open-sys2"
 version = "5.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2444,8 +2453,10 @@ dependencies = [
  "ctrlc",
  "lazy_static",
  "libbpf-rs 0.24.8",
+ "libbpf-sys",
  "libc",
  "log",
+ "perf-event-open-sys",
  "plain",
  "scx_stats",
  "scx_stats_derive",

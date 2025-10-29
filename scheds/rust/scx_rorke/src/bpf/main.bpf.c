@@ -218,6 +218,44 @@ static int timer_callback(void* map, int* key, struct bpf_timer* timer) {
   return 0;
 }
 
+/*
+ * Perf event handler: attach perf fds opened by userspace to this BPF program.
+ * This handler extracts the sampled instruction count (sample_period) and
+ * accumulates it into a per-cpu counter map `instr_counts`.
+ */
+
+struct {
+  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+  __uint(max_entries, MAX_CPUS);
+  __type(key, u32);
+  __type(value, u64);
+} instr_counts SEC(".maps");
+
+SEC("perf_event")
+int on_perf_event(struct bpf_perf_event_data *ctx)
+{
+    u32 cpu = bpf_get_smp_processor_id();
+    u32 idx = cpu;
+
+    /* Try to read the sample period from the perf event ctx. For hardware
+     * instruction events this typically equals the number of instructions
+     * sampled at this instance (i.e. the period). Use CO-RE read to be
+     * compatible across kernel versions.
+     */
+    u64 instr = 0;
+    instr = BPF_CORE_READ(ctx, addr);
+
+    /* Lookup per-cpu counter and add the sampled instructions. We use the
+     * percpu array so updates are cheap and race-free for the local CPU.
+     */
+    u64 *cnt = bpf_map_lookup_percpu_elem(&instr_counts, &idx, cpu);
+    if (cnt) {
+        __sync_fetch_and_add(cnt, instr);
+    }
+	bpf_printk("CPU %d: Instructions executed: %llu", cpu, instr);
+
+    return 0;
+}
 s32 BPF_STRUCT_OPS_SLEEPABLE(rorke_init) {
   int ret;
   u32 i;

@@ -16,6 +16,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
+use std::os::fd::{AsFd, AsRawFd};
 
 use libc::{sched_param, sched_setscheduler};
 use std::process::Command;
@@ -34,6 +35,8 @@ use libbpf_rs::OpenObject;
 
 use log::debug;
 use log::info;
+
+use perf_event_open_sys as sys;
 
 use scx_stats::prelude::*;
 
@@ -170,6 +173,7 @@ struct Scheduler<'a> {
     skel: BpfSkel<'a>,
     struct_ops: Option<libbpf_rs::Link>,
     stats_server: StatsServer<(), Metrics>,
+    perf_links: Vec<i32>,
 }
 
 impl<'a> Scheduler<'a> {
@@ -214,6 +218,49 @@ impl<'a> Scheduler<'a> {
         skel.maps.rodata_data.debug = opts.verbose as u32;
 
         let mut skel = scx_ops_load!(skel, rorke, uei)?;
+
+        let mut perf_links = Vec::<i32>::new();
+        for cpu in 0..opts.num_cpus {
+            let mut attrs = sys::bindings::perf_event_attr::default();
+            attrs.size = std::mem::size_of::<sys::bindings::perf_event_attr>() as u32;
+            attrs.type_ = sys::bindings::PERF_TYPE_HARDWARE;
+            attrs.set_disabled(1);
+            attrs.set_exclude_kernel(1);
+            attrs.set_exclude_hv(1);
+			attrs.__bindgen_anon_1.sample_period = 100; // perf event triggers every sample_period instructions
+			attrs.config = sys::bindings::PERF_COUNT_HW_INSTRUCTIONS as u64;
+
+            let perf_fd = unsafe {
+                sys::perf_event_open(&mut attrs, -1, cpu as i32, -1, 0)
+            };
+            if perf_fd < 0 {
+                return Err(anyhow!("Cannot open perf instructions event for pcpu {:?}", cpu));
+            }
+			// Fd of the BPF program to attach
+            let prog_fd = skel.progs.on_perf_event.as_fd().as_raw_fd();
+            // Create link between perf event and BPF program
+            let link_fd = unsafe {
+                libbpf_sys::bpf_link_create(
+                    prog_fd,
+                    perf_fd,
+                    libbpf_sys::BPF_PERF_EVENT as u32,
+                    std::ptr::null(),
+                )
+            };
+            if link_fd < 0 {
+                return Err(anyhow!("Failed to create perf event link for CPU {}", cpu));
+            }
+
+			// Enable the perf event
+            let enable_rc = unsafe {
+                libc::ioctl(perf_fd, 0x2400, 0)
+            };
+            if enable_rc != 0 {
+                return Err(anyhow!("Failed to enable perf event for CPU {}", cpu));
+            }
+
+            perf_links.push(link_fd);
+        }
 
         initialize_cpu_ctxs(&skel, &cpu_allocation)?;
 
@@ -280,6 +327,7 @@ impl<'a> Scheduler<'a> {
             skel,
             struct_ops,
             stats_server,
+            perf_links,
         })
     }
 
@@ -318,6 +366,13 @@ impl<'a> Scheduler<'a> {
 impl<'a> Drop for Scheduler<'a> {
     fn drop(&mut self) {
         info!("Unregister {} scheduler", SCHEDULER_NAME);
+        
+        // Clean up perf links
+        for &link_fd in self.perf_links.iter() {
+            unsafe {
+                libc::close(link_fd);
+            }
+        }
     }
 }
 
