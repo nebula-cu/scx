@@ -46,28 +46,11 @@ volatile u64 nr_direct_to_idle_dispatches, nr_kthread_dispatches,
 
 const u64 min_timer_interval_ns = 100000; // 100us
 const u64 max_timer_interval_ns = 1000000; // 1000us
-
-struct {
-  __uint(type, BPF_MAP_TYPE_ARRAY);
-  __uint(max_entries, 1);
-  __type(key, u32);
-  __type(value, u64);
-} config_map SEC(".maps");
-
-static u64 read_timer_interval_ns(void) {
-  u32 key = 0;
-  u64 *val = bpf_map_lookup_elem(&config_map, &key);
-  if (val)
-    return *val;
-  return min_timer_interval_ns;
-}
-
-static int write_timer_interval_ns(u64 new_val) {
-  u32 key = 0;
-  return bpf_map_update_elem(&config_map, &key, &new_val, BPF_ANY);
-}
+volatile u64 timer_interval_ns = min_timer_interval_ns;
 
 static u64 compute_timer_interval_ns(struct sched_data* data) {
+  trace("compute_timer_interval_ns: instr=%llu cycles=%llu\n",
+             data->instr, data->cycles);
   return min_timer_interval_ns;
 }
 
@@ -231,8 +214,7 @@ void BPF_STRUCT_OPS(rorke_running, struct task_struct* p) {
     memset(&cctx->data, 0, sizeof(struct sched_data));
   }
 
-  u64 tval = read_timer_interval_ns();
-  int ret = bpf_timer_start(timer, tval, BPF_F_TIMER_CPU_PIN);
+  int ret = bpf_timer_start(timer, timer_interval_ns, BPF_F_TIMER_CPU_PIN);
   if (ret == -EINVAL) {
     scx_bpf_error("Failed to pin timer for cpu - %d", cpu);
     return;
@@ -251,11 +233,10 @@ static int timer_callback(void* map, int* key, struct bpf_timer* timer) {
 
   s32 current_cpu = bpf_get_smp_processor_id();
   cctx = try_lookup_cpu_ctx(current_cpu);
-  if (cctx)
+  if (cctx) {
     cctx->preempted++;
-
-  u64 timer_interval_ns = compute_timer_interval_ns(&cctx->data);
-  write_timer_interval_ns(timer_interval_ns);
+    timer_interval_ns = compute_timer_interval_ns(&cctx->data);
+  }
 
   scx_bpf_kick_cpu(current_cpu, SCX_KICK_PREEMPT);
   trace("timer_callback: preempted CPU %d", current_cpu);
@@ -274,7 +255,6 @@ int count_instr(struct bpf_perf_event_data *ctx)
   if (cctx) {
     cctx->data.instr += cnt;
   }
-  trace("count_instr: CPU %d counted %llu instructions\n", current_cpu, cnt);
   return 0;
 }
 
@@ -290,7 +270,6 @@ int count_cycles(struct bpf_perf_event_data *ctx)
   if (cctx) {
     cctx->data.cycles += cnt;
   }
-  trace("count_cycles: CPU %d counted %llu cycles\n", current_cpu, cnt);
   return 0;
 }
 
@@ -306,8 +285,6 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(rorke_init) {
     }
     info("rorke_init: created dsq for VM-%d", vms[i]);
   }
-
-  write_timer_interval_ns(min_timer_interval_ns);
 
   struct bpf_timer* timer;
   bpf_for(i, 0, nr_cpus) {
