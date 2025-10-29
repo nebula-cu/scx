@@ -44,7 +44,8 @@ struct cpu_ctx {
   u64 last_running;
   u64 preempted;
   u64 vm_id;
-  struct sched_data data;
+  struct sched_data cur_data; // data for the current preemption slice
+  struct sched_data total_data; // total data for at most timer_interval_update_period slices
 };
 
 #endif /* __INTF_H */

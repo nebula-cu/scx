@@ -236,14 +236,14 @@ impl<'a> Scheduler<'a> {
 			SchedMetric {
 				name: "instructions".to_string(),
 				config: sys::bindings::PERF_COUNT_HW_INSTRUCTIONS as u64,
-				sample_period: 150_000,
+				sample_period: 100_000,
 				prog_fd: prog_fd(&skel.progs.count_instr),
 				link_fds: vec![],
 			},
 			SchedMetric {
 				name: "cycles".to_string(),
 				config: sys::bindings::PERF_COUNT_HW_CPU_CYCLES as u64,
-				sample_period: 75_000,
+				sample_period: 100_000,
 				prog_fd: prog_fd(&skel.progs.count_cycles),
 				link_fds: vec![],
 			},

@@ -46,6 +46,7 @@ volatile u64 nr_direct_to_idle_dispatches, nr_kthread_dispatches,
 
 const u64 min_timer_interval_ns = 100000; // 100us
 const u64 max_timer_interval_ns = 1000000; // 1000us
+const u64 timer_interval_update_period = 10; // every 10 preemptions
 volatile u64 timer_interval_ns = min_timer_interval_ns;
 
 static u64 compute_timer_interval_ns(struct sched_data* data) {
@@ -81,6 +82,11 @@ struct {
 struct cpu_ctx* try_lookup_cpu_ctx(s32 cpu) {
   const u32 idx = 0;
   return bpf_map_lookup_percpu_elem(&cpu_ctx_stor, &idx, cpu);
+}
+
+static void merge_sched_data(struct sched_data* dest, struct sched_data* src) {
+  dest->instr += src->instr;
+  dest->cycles += src->cycles;
 }
 
 /*
@@ -211,7 +217,7 @@ void BPF_STRUCT_OPS(rorke_running, struct task_struct* p) {
   struct cpu_ctx* cctx;
   cctx = try_lookup_cpu_ctx(cpu);
   if (cctx) {
-    memset(&cctx->data, 0, sizeof(struct sched_data));
+    memset(&cctx->cur_data, 0, sizeof(struct sched_data));
   }
 
   int ret = bpf_timer_start(timer, timer_interval_ns, BPF_F_TIMER_CPU_PIN);
@@ -235,7 +241,11 @@ static int timer_callback(void* map, int* key, struct bpf_timer* timer) {
   cctx = try_lookup_cpu_ctx(current_cpu);
   if (cctx) {
     cctx->preempted++;
-    timer_interval_ns = compute_timer_interval_ns(&cctx->data);
+	merge_sched_data(&cctx->total_data, &cctx->cur_data);
+	if (cctx->preempted % timer_interval_update_period == 0) {
+		timer_interval_ns = compute_timer_interval_ns(&cctx->total_data);
+		memset(&cctx->total_data, 0, sizeof(struct sched_data));
+	}
   }
 
   scx_bpf_kick_cpu(current_cpu, SCX_KICK_PREEMPT);
@@ -252,9 +262,8 @@ int count_instr(struct bpf_perf_event_data *ctx)
 
   s32 current_cpu = bpf_get_smp_processor_id();
   cctx = try_lookup_cpu_ctx(current_cpu);
-  if (cctx) {
-    cctx->data.instr += cnt;
-  }
+  if (cctx)
+    cctx->cur_data.instr += cnt;
   return 0;
 }
 
@@ -267,9 +276,8 @@ int count_cycles(struct bpf_perf_event_data *ctx)
 
   s32 current_cpu = bpf_get_smp_processor_id();
   cctx = try_lookup_cpu_ctx(current_cpu);
-  if (cctx) {
-    cctx->data.cycles += cnt;
-  }
+  if (cctx)
+    cctx->cur_data.cycles += cnt;
   return 0;
 }
 
