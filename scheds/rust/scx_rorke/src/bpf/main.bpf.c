@@ -46,13 +46,45 @@ volatile u64 nr_direct_to_idle_dispatches, nr_kthread_dispatches,
 
 const u64 min_timer_interval_ns = 100000; // 100us
 const u64 max_timer_interval_ns = 1000000; // 1000us
-const u64 timer_interval_update_period = 10; // every 10 preemptions
+const u64 timer_interval_update_period = 10; // update timer interval every this many preemptions
 volatile u64 timer_interval_ns = min_timer_interval_ns;
 
+/*
+ * Compute timer interval based on IPC.
+ * For now, just linearly interpolate between points
+ * (ipc=2.0, ps=100us) and (ipc=2.55, ps=1000us).
+ */
 static u64 compute_timer_interval_ns(struct sched_data* data) {
-  trace("compute_timer_interval_ns: instr=%llu cycles=%llu\n",
-             data->instr, data->cycles);
-  return min_timer_interval_ns;
+  // Avoid division by zero
+  if (data->cycles == 0)
+    return min_timer_interval_ns;
+
+  // Calculate IPC (instructions per cycle)
+  u64 ipc_fixed = (data->instr << 16) / data->cycles; // Q16.16 fixed point
+  
+  // IPC thresholds in Q16.16 (2.0 and 2.55)
+  const u64 min_ipc = 2ULL << 16;        // 2.0
+  const u64 max_ipc = (255ULL << 16)/100;  // 2.55
+
+  // If IPC <= 2.0, use min interval
+  if (ipc_fixed <= min_ipc)
+    return min_timer_interval_ns;
+  
+  // If IPC >= 2.55, use max interval
+  if (ipc_fixed >= max_ipc)
+    return max_timer_interval_ns;
+
+  // Linear interpolation between min_timer_interval_ns and max_timer_interval_ns
+  // as IPC goes from 2.0 to 2.55
+  u64 ipc_range = max_ipc - min_ipc;
+  u64 interval_range = max_timer_interval_ns - min_timer_interval_ns;
+  u64 ipc_offset = ipc_fixed - min_ipc;
+
+  // Calculate interpolated value: min + (offset/range) * interval_range
+  u64 interval = min_timer_interval_ns + 
+    ((ipc_offset * interval_range) / ipc_range);
+
+  return interval;
 }
 
 /*
@@ -244,6 +276,8 @@ static int timer_callback(void* map, int* key, struct bpf_timer* timer) {
 	merge_sched_data(&cctx->total_data, &cctx->cur_data);
 	if (cctx->preempted % timer_interval_update_period == 0) {
 		timer_interval_ns = compute_timer_interval_ns(&cctx->total_data);
+		trace("compute_timer_interval_ns: instr=%llu cycles=%llu -> ps=%llu\n",
+             cctx->total_data.instr, cctx->total_data.cycles, timer_interval_ns);
 		memset(&cctx->total_data, 0, sizeof(struct sched_data));
 	}
   }
