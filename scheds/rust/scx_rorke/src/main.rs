@@ -220,7 +220,7 @@ impl<'a> Scheduler<'a> {
         // Initialize skel
         skel.maps.rodata_data.nr_cpus = opts.num_cpus;
         skel.maps.rodata_data.nr_vms = vm_config.len() as u32;
-        skel.maps.rodata_data.timer_interval_ns = opts.timer_interval * 1000;
+        // skel.maps.rodata_data.timer_interval_ns = opts.timer_interval * 1000;
         for (i, vm) in vm_config.iter().enumerate() {
             skel.maps.rodata_data.vms[i] = vm.vm_id;
         }
