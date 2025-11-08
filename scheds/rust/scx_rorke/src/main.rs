@@ -239,7 +239,7 @@ impl<'a> Scheduler<'a> {
 				name: "llc_misses".to_string(), // Human-readable label
 				event_type: sys::bindings::PERF_TYPE_RAW,
 				config: 0x412E, // raw event code for longest_lat_cache.miss. Source: https://github.com/intel/perfmon/blob/main/SKL/events/skylake_core.json#L953
-				sample_period: 10_000,
+				sample_period: 100_000,
 				prog_fd: prog_fd(&skel.progs.count_llc_misses),
 				link_fds: vec![],
 			},

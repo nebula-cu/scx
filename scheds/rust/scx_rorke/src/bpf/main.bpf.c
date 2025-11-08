@@ -40,7 +40,7 @@ volatile u64 nr_direct_to_idle_dispatches, nr_kthread_dispatches,
 
 const u64 min_timer_interval_ns = 100000; // 100us
 const u64 max_timer_interval_ns = 1000000; // 1ms
-const u64 switch_time_ns = 5000000000; // 5s
+const u64 switch_time_ns = 10000000000; // 10s
 const u64 llc_miss_latency_ns = 4000; // 4us
 
 /*
@@ -308,6 +308,8 @@ int count_llc_misses(struct bpf_perf_event_data *ctx)
   struct cpu_ctx* cctx;
 
   u64 cnt = BPF_CORE_READ(ctx, addr);
+  info("count_llc_misses: CPU %d, llc_misses=%llu",
+	   bpf_get_smp_processor_id(), cnt);
 
   s32 current_cpu = bpf_get_smp_processor_id();
   cctx = try_lookup_cpu_ctx(current_cpu);
