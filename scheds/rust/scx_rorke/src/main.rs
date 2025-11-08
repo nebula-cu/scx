@@ -171,6 +171,7 @@ fn initialize_cpu_ctxs(skel: &BpfSkel, cpu_allocation: &Vec<u64>) -> Result<()> 
 
 struct SchedMetric {
     name: String, // human-readable label
+	event_type: u32, // PERF_TYPE_HARDWARE, PERF_TYPE_RAW, etc.
     config: u64, // what to count, e.g. PERF_COUNT_HW_INSTRUCTIONS
     sample_period: u64, // perf event is triggered every sample_period counts
     prog_fd: i32, // fd of the BPF program to attach
@@ -219,7 +220,7 @@ impl<'a> Scheduler<'a> {
 
         // Initialize skel
         skel.maps.rodata_data.nr_cpus = opts.num_cpus;
-		skel.maps.rodata_data.nr_vcpus = cpu_allocation.len() as u32;
+		skel.maps.rodata_data.nr_vcpus = vm_config.iter().map(|vm| vm.vcpus.len() as u32).sum(); 
         skel.maps.rodata_data.nr_vms = vm_config.len() as u32;
         // skel.maps.rodata_data.timer_interval_ns = opts.timer_interval * 1000;
         for (i, vm) in vm_config.iter().enumerate() {
@@ -236,7 +237,8 @@ impl<'a> Scheduler<'a> {
 		let mut sched_metrics: Vec<SchedMetric> = vec![
 			SchedMetric {
 				name: "llc_misses".to_string(), // Human-readable label
-				config: sys::bindings::LONGEST_LAT_CACHE.MISS as u64,
+				event_type: sys::bindings::PERF_TYPE_RAW,
+				config: 0x412E, // raw event code for longest_lat_cache.miss. Source: https://github.com/intel/perfmon/blob/main/SKL/events/skylake_core.json#L953
 				sample_period: 10_000,
 				prog_fd: prog_fd(&skel.progs.count_llc_misses),
 				link_fds: vec![],
@@ -247,7 +249,7 @@ impl<'a> Scheduler<'a> {
 			for metric in sched_metrics.iter_mut() {
 				let mut attrs = sys::bindings::perf_event_attr::default();
 				attrs.size = std::mem::size_of::<sys::bindings::perf_event_attr>() as u32;
-				attrs.type_ = sys::bindings::PERF_TYPE_HARDWARE;
+				attrs.type_ = metric.event_type;
 				attrs.set_disabled(1);
 				attrs.set_exclude_kernel(1);
 				attrs.set_exclude_hv(1);
