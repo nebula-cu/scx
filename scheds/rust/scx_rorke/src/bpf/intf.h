@@ -33,8 +33,7 @@ enum consts {
 };
 
 struct sched_data {
-	u64 instr;
-	u64 cycles;
+	u64 llc_misses;
 };
 
 /*
@@ -44,8 +43,9 @@ struct cpu_ctx {
   u64 last_running;
   u64 preempted;
   u64 vm_id;
-  struct sched_data cur_data; // data for the current preemption slice
-  struct sched_data total_data; // total data for at most timer_interval_update_period slices
+  u64 timer_interval_ns;
+  u64 preemptions_remaining;
+  struct sched_data data;
 };
 
 #endif /* __INTF_H */

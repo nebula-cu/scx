@@ -219,6 +219,7 @@ impl<'a> Scheduler<'a> {
 
         // Initialize skel
         skel.maps.rodata_data.nr_cpus = opts.num_cpus;
+		skel.maps.rodata_data.nr_vcpus = cpu_allocation.len() as u32;
         skel.maps.rodata_data.nr_vms = vm_config.len() as u32;
         // skel.maps.rodata_data.timer_interval_ns = opts.timer_interval * 1000;
         for (i, vm) in vm_config.iter().enumerate() {
@@ -234,17 +235,10 @@ impl<'a> Scheduler<'a> {
 		// This needs to be initalized after skel is loaded to get valid prog fds
 		let mut sched_metrics: Vec<SchedMetric> = vec![
 			SchedMetric {
-				name: "instructions".to_string(),
-				config: sys::bindings::PERF_COUNT_HW_INSTRUCTIONS as u64,
-				sample_period: 100_000,
-				prog_fd: prog_fd(&skel.progs.count_instr),
-				link_fds: vec![],
-			},
-			SchedMetric {
-				name: "cycles".to_string(),
-				config: sys::bindings::PERF_COUNT_HW_CPU_CYCLES as u64,
-				sample_period: 100_000,
-				prog_fd: prog_fd(&skel.progs.count_cycles),
+				name: "llc_misses".to_string(), // Human-readable label
+				config: sys::bindings::LONGEST_LAT_CACHE.MISS as u64,
+				sample_period: 10_000,
+				prog_fd: prog_fd(&skel.progs.count_llc_misses),
 				link_fds: vec![],
 			},
 		];

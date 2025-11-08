@@ -29,6 +29,7 @@ UEI_DEFINE(uei);
  * Here we assign values just to pass the verifier.
  */
 const volatile u32 nr_cpus = 1;
+const volatile u32 nr_vcpus = 1;
 const volatile u32 nr_vms = 1;
 const volatile u64 vms[MAX_VMS];
 const volatile u32 debug = 0;
@@ -37,54 +38,16 @@ const volatile u32 debug = 0;
 volatile u64 nr_direct_to_idle_dispatches, nr_kthread_dispatches,
     nr_vm_dispatches, nr_running;
 
-/* Timer interval
- * We store the timer interval in a 1-entry BPF array map so it can be
- * safely updated (from userspace or from BPF) without torn reads/writes
- * across CPUs. Reading code should lookup the element and fall back to
- * a default if the map lookup fails.
- */
-
 const u64 min_timer_interval_ns = 100000; // 100us
-const u64 max_timer_interval_ns = 1000000; // 1000us
-const u64 timer_interval_update_period = 10; // update timer interval every this many preemptions
-volatile u64 timer_interval_ns = min_timer_interval_ns;
+const u64 max_timer_interval_ns = 1000000; // 1ms
+const u64 switch_time_ns = 5000000000; // 5s
+const u64 llc_miss_latency_ns = 2000; // 2us
 
 /*
  * Compute timer interval based on IPC.
- * For now, just linearly interpolate between points
- * (ipc=2.0, ps=100us) and (ipc=2.55, ps=1000us).
  */
 static u64 compute_timer_interval_ns(struct sched_data* data) {
-  // Avoid division by zero
-  if (data->cycles == 0)
-    return min_timer_interval_ns;
-
-  // Calculate IPC (instructions per cycle)
-  u64 ipc_fixed = (data->instr << 16) / data->cycles; // Q16.16 fixed point
-  
-  // IPC thresholds in Q16.16 (2.0 and 2.55)
-  const u64 min_ipc = 2ULL << 16;        // 2.0
-  const u64 max_ipc = (255ULL << 16)/100;  // 2.55
-
-  // If IPC <= 2.0, use min interval
-  if (ipc_fixed <= min_ipc)
-    return min_timer_interval_ns;
-  
-  // If IPC >= 2.55, use max interval
-  if (ipc_fixed >= max_ipc)
-    return max_timer_interval_ns;
-
-  // Linear interpolation between min_timer_interval_ns and max_timer_interval_ns
-  // as IPC goes from 2.0 to 2.55
-  u64 ipc_range = max_ipc - min_ipc;
-  u64 interval_range = max_timer_interval_ns - min_timer_interval_ns;
-  u64 ipc_offset = ipc_fixed - min_ipc;
-
-  // Calculate interpolated value: min + (offset/range) * interval_range
-  u64 interval = min_timer_interval_ns + 
-    ((ipc_offset * interval_range) / ipc_range);
-
-  return interval;
+  return 0;
 }
 
 /*
@@ -114,11 +77,6 @@ struct {
 struct cpu_ctx* try_lookup_cpu_ctx(s32 cpu) {
   const u32 idx = 0;
   return bpf_map_lookup_percpu_elem(&cpu_ctx_stor, &idx, cpu);
-}
-
-static void merge_sched_data(struct sched_data* dest, struct sched_data* src) {
-  dest->instr += src->instr;
-  dest->cycles += src->cycles;
 }
 
 /*
@@ -249,10 +207,10 @@ void BPF_STRUCT_OPS(rorke_running, struct task_struct* p) {
   struct cpu_ctx* cctx;
   cctx = try_lookup_cpu_ctx(cpu);
   if (cctx) {
-    memset(&cctx->cur_data, 0, sizeof(struct sched_data));
+    memset(&cctx->data, 0, sizeof(struct sched_data));
   }
 
-  int ret = bpf_timer_start(timer, timer_interval_ns, BPF_F_TIMER_CPU_PIN);
+  int ret = bpf_timer_start(timer, cctx->timer_interval_ns, BPF_F_TIMER_CPU_PIN);
   if (ret == -EINVAL) {
     scx_bpf_error("Failed to pin timer for cpu - %d", cpu);
     return;
@@ -273,13 +231,12 @@ static int timer_callback(void* map, int* key, struct bpf_timer* timer) {
   cctx = try_lookup_cpu_ctx(current_cpu);
   if (cctx) {
     cctx->preempted++;
-	merge_sched_data(&cctx->total_data, &cctx->cur_data);
-	if (cctx->preempted % timer_interval_update_period == 0) {
-		timer_interval_ns = compute_timer_interval_ns(&cctx->total_data);
-		trace("compute_timer_interval_ns: instr=%llu cycles=%llu -> ps=%llu\n",
-             cctx->total_data.instr, cctx->total_data.cycles, timer_interval_ns);
-		memset(&cctx->total_data, 0, sizeof(struct sched_data));
-	}
+	// if (cctx->preempted % timer_interval_update_period == 0) {
+	// 	timer_interval_ns = compute_timer_interval_ns(&cctx->total_data);
+	// 	trace("compute_timer_interval_ns: instr=%llu cycles=%llu -> ps=%llu\n",
+    //          cctx->total_data.instr, cctx->total_data.cycles, timer_interval_ns);
+	// 	memset(&cctx->total_data, 0, sizeof(struct sched_data));
+	// }
   }
 
   scx_bpf_kick_cpu(current_cpu, SCX_KICK_PREEMPT);
@@ -288,7 +245,7 @@ static int timer_callback(void* map, int* key, struct bpf_timer* timer) {
 }
 
 SEC("perf_event")
-int count_instr(struct bpf_perf_event_data *ctx)
+int count_llc_misses(struct bpf_perf_event_data *ctx)
 {
   struct cpu_ctx* cctx;
 
@@ -297,21 +254,7 @@ int count_instr(struct bpf_perf_event_data *ctx)
   s32 current_cpu = bpf_get_smp_processor_id();
   cctx = try_lookup_cpu_ctx(current_cpu);
   if (cctx)
-    cctx->cur_data.instr += cnt;
-  return 0;
-}
-
-SEC("perf_event")
-int count_cycles(struct bpf_perf_event_data *ctx)
-{
-  struct cpu_ctx* cctx;
-
-  u64 cnt = BPF_CORE_READ(ctx, addr);
-
-  s32 current_cpu = bpf_get_smp_processor_id();
-  cctx = try_lookup_cpu_ctx(current_cpu);
-  if (cctx)
-    cctx->cur_data.cycles += cnt;
+    cctx->data.llc_misses += cnt;
   return 0;
 }
 
@@ -338,6 +281,14 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(rorke_init) {
     bpf_timer_init(timer, &timers, CLOCK_MONOTONIC);
     bpf_timer_set_callback(timer, timer_callback);
     info("rorke_init: initialized timer for cpu - %d\n", i);
+	struct cpu_ctx* cctx;
+	cctx = try_lookup_cpu_ctx(i);
+	if (!cctx) {
+	  scx_bpf_error("rorke_init: failed to lookup cpu_ctx for cpu - %d\n", i);
+	  return -ESRCH;
+	}
+	cctx->timer_interval_ns = min_timer_interval_ns;
+	cctx->preemptions_remaining = switch_time_ns / min_timer_interval_ns;
   }
   return ret;
 }
