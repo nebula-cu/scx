@@ -40,16 +40,54 @@ volatile u64 nr_direct_to_idle_dispatches, nr_kthread_dispatches,
 
 const u64 min_timer_interval_ns = 100000; // 100us
 const u64 max_timer_interval_ns = 1000000; // 1ms
-const u64 switch_time_ns = 3000000000; // 3s
-const u64 llc_miss_latency_ns = 4000; // 4us
-const u64 max_interval_change_ns = 200000; // 200us
+const u64 switch_time_ns = 5000000000; // 5s
+const u64 llc_miss_latency_ns = 200; // 200ns
 
 /*
- * Compute timer interval based on IPC.
+ * Data window helpers.
+ */
+static void data_window_init_idx(struct data_window* dw, u32 idx) {
+  if (idx < WINDOW_SIZE) {
+    dw->window[idx].llc_misses = 0;
+    dw->window[idx].interval_ns = switch_time_ns;
+  }
+}
+
+static void data_window_init(struct data_window* dw) {
+  memset(dw, 0, sizeof(*dw));
+  dw->current = 0;
+  data_window_init_idx(dw, 0);
+}
+
+static void data_window_advance(struct data_window* dw) {
+  u32 idx = dw->current + 1;
+  if (idx >= WINDOW_SIZE)
+    idx = 0;
+  dw->current = idx;
+  data_window_init_idx(dw, idx);
+}
+
+static struct sched_data* data_window_current(struct data_window* dw) {
+  u32 idx = dw->current;
+  return idx < WINDOW_SIZE ? &dw->window[dw->current] : NULL;
+}
+
+static void data_window_accumulate(struct data_window* dw,
+                                   struct sched_data* acc) {
+  int i;
+  memset(acc, 0, sizeof(*acc));
+  for (i = 0; i < WINDOW_SIZE; i++) {
+    acc->llc_misses += dw->window[i].llc_misses;
+    acc->interval_ns += dw->window[i].interval_ns;
+  }
+}
+
+/*
+ * Compute timer interval.
  */
 static u64 compute_timer_interval_ns(u64 old_timer_interval_ns, struct sched_data* data) {
   /*
-   * rho = llc_misses * llc_miss_latency / switch_time
+   * rho = llc_misses * llc_miss_latency / interval
    * oversubcription_ratio = nr_vcpus / nr_cpus
    * if rho >= 1.0:
    *     return max_timer_interval_ns
@@ -62,12 +100,12 @@ static u64 compute_timer_interval_ns(u64 old_timer_interval_ns, struct sched_dat
    * return new_timer_interval_ns
    */
 
-  info("compute_timer_interval_ns: old_timer_interval_ns=%llu, llc_misses=%llu",
+  info("compute interval: old interval=%llu, llc_misses=%llu",
 	   old_timer_interval_ns, data->llc_misses);
 
   if (data->llc_misses == 0) {
     // Anomalous case: no LLC misses recorded, return old interval
-    info("compute_timer_interval_ns: llc_misses=0, returning old_timer_interval_ns=%llu",
+    info("compute interval: llc_misses=0, returning old interval=%llu",
      old_timer_interval_ns);
     return old_timer_interval_ns;
   }
@@ -76,9 +114,8 @@ static u64 compute_timer_interval_ns(u64 old_timer_interval_ns, struct sched_dat
   static const u64 SCALE = 1000000;
   static const u64 EPSILON_FP = 200000; // 0.2 in fixed-point
   u64 llc_misses = data->llc_misses;
-  u64 rho_fp = 0;
-  if (switch_time_ns > 0)
-    rho_fp = (llc_misses * llc_miss_latency_ns * SCALE) / switch_time_ns;
+  u64 interval_ns = data->interval_ns;
+  u64 rho_fp = (llc_misses * llc_miss_latency_ns * SCALE) / interval_ns;
 
   // oversubscription_ratio = nr_vcpus / nr_cpus (fixed-point)
   u64 oversub_fp = 0;
@@ -89,7 +126,7 @@ static u64 compute_timer_interval_ns(u64 old_timer_interval_ns, struct sched_dat
   // If rho >= 1.0 (i.e., rho_fp >= SCALE)
   if (rho_fp >= SCALE) {
     new_timer_interval_ns = max_timer_interval_ns;
-    info("compute_timer_interval_ns: rho_fp >= SCALE, returning max_timer_interval_ns=%llu",
+    info("compute_timer_interval_ns: rho_fp >= SCALE, returning max interval=%llu",
      max_timer_interval_ns);
   } else {
     // chain_latency = (oversubscription_ratio - 1) * old_timer_interval_ns * rho / (1 - rho)
@@ -108,9 +145,9 @@ static u64 compute_timer_interval_ns(u64 old_timer_interval_ns, struct sched_dat
     // new_timer_interval_ns = chain_latency * 1.2 (fixed-point: 1.2 = 1200000)
     new_timer_interval_ns = (chain_latency * (SCALE + EPSILON_FP)) / SCALE / SCALE;
 
-    info("compute_timer_interval_ns: llc_misses=%llu, rho_fp=%llu, "
+    info("compute interval: llc_misses=%llu, sample_interval=%llu, rho_fp=%llu, "
         "oversub_fp=%llu, chain_latency=%llu, new_timer_interval_ns=%llu",
-      llc_misses, rho_fp, oversub_fp, chain_latency, new_timer_interval_ns);
+      llc_misses, interval_ns, rho_fp, oversub_fp, chain_latency, new_timer_interval_ns);
   }
 
   info("new_timer_interval_ns: %llu, old_timer_interval_ns=%llu",
@@ -119,12 +156,6 @@ static u64 compute_timer_interval_ns(u64 old_timer_interval_ns, struct sched_dat
     new_timer_interval_ns = min_timer_interval_ns;
   if (new_timer_interval_ns > max_timer_interval_ns)
     new_timer_interval_ns = max_timer_interval_ns;
-  if (new_timer_interval_ns > old_timer_interval_ns + max_interval_change_ns) {
-    new_timer_interval_ns = old_timer_interval_ns + max_interval_change_ns;
-  }
-  if (new_timer_interval_ns + max_interval_change_ns < old_timer_interval_ns) {
-	  new_timer_interval_ns = old_timer_interval_ns - max_interval_change_ns;
-  }
 
   return new_timer_interval_ns;
 }
@@ -313,11 +344,13 @@ static int timer_callback(void* map, int* key, struct bpf_timer* timer) {
     cctx->preempted++;
     cctx->preemptions_remaining--;
     if (cctx->preemptions_remaining == 0) {
-      cctx->timer_interval_ns = compute_timer_interval_ns(cctx->timer_interval_ns, &cctx->data);
-      cctx->preemptions_remaining = switch_time_ns / cctx->timer_interval_ns;
+      struct sched_data acc;
+      data_window_accumulate(&cctx->data, &acc);
+      cctx->timer_interval_ns = compute_timer_interval_ns(cctx->timer_interval_ns, &acc);
       info("timer_callback: updated timer interval to %llu ns - pCPU %d",
           cctx->timer_interval_ns, current_cpu);
-      memset(&cctx->data, 0, sizeof(struct sched_data));
+      cctx->preemptions_remaining = switch_time_ns / cctx->timer_interval_ns;
+      data_window_advance(&cctx->data);
     }
   }
 
@@ -337,8 +370,13 @@ int count_llc_misses(struct bpf_perf_event_data *ctx)
 
   s32 current_cpu = bpf_get_smp_processor_id();
   cctx = try_lookup_cpu_ctx(current_cpu);
-  if (cctx)
-    cctx->data.llc_misses += cnt;
+  if (cctx) {
+    struct sched_data* cur_data = data_window_current(&cctx->data);
+
+    if (cur_data) {
+      cur_data->llc_misses += cnt;
+    }
+  }
   return 0;
 }
 
@@ -365,14 +403,15 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(rorke_init) {
     bpf_timer_init(timer, &timers, CLOCK_MONOTONIC);
     bpf_timer_set_callback(timer, timer_callback);
     info("rorke_init: initialized timer for cpu - %d\n", i);
-	struct cpu_ctx* cctx;
-	cctx = try_lookup_cpu_ctx(i);
-	if (!cctx) {
-	  scx_bpf_error("rorke_init: failed to lookup cpu_ctx for cpu - %d\n", i);
-	  return -ESRCH;
-	}
-	cctx->timer_interval_ns = min_timer_interval_ns;
-	cctx->preemptions_remaining = switch_time_ns / min_timer_interval_ns;
+    struct cpu_ctx* cctx;
+    cctx = try_lookup_cpu_ctx(i);
+    if (!cctx) {
+      scx_bpf_error("rorke_init: failed to lookup cpu_ctx for cpu - %d\n", i);
+      return -ESRCH;
+    }
+    cctx->timer_interval_ns = min_timer_interval_ns;
+    cctx->preemptions_remaining = switch_time_ns / min_timer_interval_ns;
+    data_window_init(&cctx->data);
   }
   return ret;
 }

@@ -238,8 +238,8 @@ impl<'a> Scheduler<'a> {
         let mut sched_metrics: Vec<SchedMetric> = vec![SchedMetric {
             name: "llc_misses".to_string(), // Human-readable label
             event_type: sys::bindings::PERF_TYPE_RAW,
-            config: 0x412E, // raw event code for longest_lat_cache.miss. Source: https://github.com/intel/perfmon/blob/main/SKL/events/skylake_core.json#L953
-            sample_period: 100_000,
+            config: 0x02A3, // raw event code for cycle_activity.stalls_l3_miss. Source: https://github.com/intel/perfmon/blob/main/ICL/events/icelake_core.json#L3061
+            sample_period: 500_000,
             prog_fd: prog_fd(&skel.progs.count_llc_misses),
             perf_fds: vec![],
             link_fds: vec![],

@@ -30,10 +30,17 @@ typedef unsigned long long u64;
 enum consts {
   MAX_CPUS = 128,
   MAX_VMS = 16,
+  WINDOW_SIZE = 3,
 };
 
 struct sched_data {
 	u64 llc_misses;
+	u64 interval_ns;
+};
+
+struct data_window {
+	struct sched_data window[WINDOW_SIZE];
+	u32 current;
 };
 
 /*
@@ -45,7 +52,7 @@ struct cpu_ctx {
   u64 vm_id;
   u64 timer_interval_ns;
   u64 preemptions_remaining;
-  struct sched_data data;
+  struct data_window data;
 };
 
 #endif /* __INTF_H */
