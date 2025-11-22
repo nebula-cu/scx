@@ -1,0 +1,27 @@
+diff --git a/include/asm-generic/vmlinux.lds.h b/include/asm-generic/vmlinux.lds.h
+index 0d5b186abee8..71e3c072e853 100644
+--- a/include/asm-generic/vmlinux.lds.h
++++ b/include/asm-generic/vmlinux.lds.h
+@@ -139,8 +139,8 @@ defined(CONFIG_AUTOFDO_CLANG) || defined(CONFIG_PROPELLER_CLANG)
+ 	*(__stop_sched_class)			\
+ 	*(__dl_sched_class)			\
+ 	*(__rt_sched_class)			\
+-	*(__fair_sched_class)			\
+ 	*(__ext_sched_class)			\
++	*(__fair_sched_class)			\
+ 	*(__idle_sched_class)			\
+ 	__sched_class_lowest = .;
+ 
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 67189907214d..0fe89dc355ba 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -8486,7 +8486,7 @@ void __init sched_init(void)
+ 	BUG_ON(!sched_class_above(&rt_sched_class, &fair_sched_class));
+ 	BUG_ON(!sched_class_above(&fair_sched_class, &idle_sched_class));
+ #ifdef CONFIG_SCHED_CLASS_EXT
+-	BUG_ON(!sched_class_above(&fair_sched_class, &ext_sched_class));
++	// BUG_ON(!sched_class_above(&fair_sched_class, &ext_sched_class));
+ 	BUG_ON(!sched_class_above(&ext_sched_class, &idle_sched_class));
+ #endif
+ 

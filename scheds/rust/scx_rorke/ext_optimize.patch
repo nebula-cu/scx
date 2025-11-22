@@ -1,0 +1,58 @@
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 67189907214d..6af7a3ec073a 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -6016,9 +6016,18 @@ __pick_next_task(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
+ 	struct task_struct *p;
+ 
+ 	rq->dl_server = NULL;
++	
++	if (scx_enabled()) {
++		if (likely(rq->nr_running == rq->scx.nr_running)) {
++			p = pick_task_scx(rq);
++			if (!p)
++				p = pick_task_idle(rq);
+ 
+-	if (scx_enabled())
++			put_prev_set_next_task(rq, prev, p);
++			return p;
++		}
+ 		goto restart;
++	}
+ 
+ 	/*
+ 	 * Optimization: we know that if all tasks are in the fair class we can
+diff --git a/kernel/sched/ext.c b/kernel/sched/ext.c
+index 7b9dfee858e7..d90d6d29677f 100644
+--- a/kernel/sched/ext.c
++++ b/kernel/sched/ext.c
+@@ -3113,7 +3113,7 @@ static struct task_struct *first_local_task(struct rq *rq)
+ 					struct task_struct, scx.dsq_list.node);
+ }
+ 
+-static struct task_struct *pick_task_scx(struct rq *rq)
++struct task_struct *pick_task_scx(struct rq *rq)
+ {
+ 	struct task_struct *prev = rq->curr;
+ 	struct task_struct *p;
+diff --git a/kernel/sched/ext.h b/kernel/sched/ext.h
+index 1079b56b0f7a..25d65c3d54ba 100644
+--- a/kernel/sched/ext.h
++++ b/kernel/sched/ext.h
+@@ -39,6 +39,8 @@ bool scx_prio_less(const struct task_struct *a, const struct task_struct *b,
+ 		   bool in_fi);
+ #endif
+ 
++struct task_struct *pick_task_scx(struct rq *rq);
++
+ #else	/* CONFIG_SCHED_CLASS_EXT */
+ 
+ static inline void scx_tick(struct rq *rq) {}
+@@ -53,6 +55,7 @@ static inline void scx_rq_deactivate(struct rq *rq) {}
+ static inline int scx_check_setscheduler(struct task_struct *p, int policy) { return 0; }
+ static inline bool task_on_scx(const struct task_struct *p) { return false; }
+ static inline void init_sched_ext_class(void) {}
++static inline struct task_struct *pick_task_scx(struct rq *rq) { return NULL; }
+ 
+ #endif	/* CONFIG_SCHED_CLASS_EXT */
+ 
