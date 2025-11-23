@@ -1,0 +1,69 @@
+diff --git a/include/asm-generic/vmlinux.lds.h b/include/asm-generic/vmlinux.lds.h
+index 0d5b186abee8..71e3c072e853 100644
+--- a/include/asm-generic/vmlinux.lds.h
++++ b/include/asm-generic/vmlinux.lds.h
+@@ -139,8 +139,8 @@ defined(CONFIG_AUTOFDO_CLANG) || defined(CONFIG_PROPELLER_CLANG)
+ 	*(__stop_sched_class)			\
+ 	*(__dl_sched_class)			\
+ 	*(__rt_sched_class)			\
+-	*(__fair_sched_class)			\
+ 	*(__ext_sched_class)			\
++	*(__fair_sched_class)			\
+ 	*(__idle_sched_class)			\
+ 	__sched_class_lowest = .;
+ 
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 67189907214d..d2c17806cf8d 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -6016,9 +6016,19 @@ __pick_next_task(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
+ 	struct task_struct *p;
+ 
+ 	rq->dl_server = NULL;
+-
+-	if (scx_enabled())
+-		goto restart;
++	
++	if (scx_enabled()){
++		if(likely(!sched_class_above(prev->sched_class, &ext_sched_class) && rq->nr_running == rq->scx.nr_running)){
++			rq->scx.flags |= SCX_RQ_BAL_PENDING;
++			ext_sched_class.balance(rq, prev, rf);
++			p = ext_sched_class.pick_task(rq);
++			if (p){
++				put_prev_set_next_task(rq, prev, p);
++				return p;
++			}
++			goto restart;
++		}
++	}
+ 
+ 	/*
+ 	 * Optimization: we know that if all tasks are in the fair class we can
+@@ -8486,7 +8496,7 @@ void __init sched_init(void)
+ 	BUG_ON(!sched_class_above(&rt_sched_class, &fair_sched_class));
+ 	BUG_ON(!sched_class_above(&fair_sched_class, &idle_sched_class));
+ #ifdef CONFIG_SCHED_CLASS_EXT
+-	BUG_ON(!sched_class_above(&fair_sched_class, &ext_sched_class));
++	// BUG_ON(!sched_class_above(&fair_sched_class, &ext_sched_class));
+ 	BUG_ON(!sched_class_above(&ext_sched_class, &idle_sched_class));
+ #endif
+ 
+diff --git a/kernel/sched/ext.c b/kernel/sched/ext.c
+index 7b9dfee858e7..e11e00caa90c 100644
+--- a/kernel/sched/ext.c
++++ b/kernel/sched/ext.c
+@@ -7069,6 +7069,14 @@ __bpf_kfunc void scx_bpf_kick_cpu(s32 cpu, u64 flags)
+ 	if (scx_rq_bypassing(this_rq))
+ 		goto out;
+ 
++	if ((flags & SCX_KICK_PREEMPT) && (cpu == smp_processor_id())) {
++		raw_spin_rq_lock(this_rq);
++		this_rq->curr->scx.slice = 0;
++		resched_curr(this_rq);
++		raw_spin_rq_unlock(this_rq);
++		goto out;
++	}
++
+ 	/*
+ 	 * Actual kicking is bounced to kick_cpus_irq_workfn() to avoid nesting
+ 	 * rq locks. We can probably be smarter and avoid bouncing if called
