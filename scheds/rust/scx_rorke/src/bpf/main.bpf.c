@@ -16,6 +16,7 @@
 #include <bpf/bpf_tracing.h>
 #include <errno.h>
 #include <stdbool.h>
+#include <string.h>
 
 #include "intf.h"
 
@@ -28,14 +29,136 @@ UEI_DEFINE(uei);
  * Here we assign values just to pass the verifier.
  */
 const volatile u32 nr_cpus = 1;
+const volatile u32 nr_vcpus = 1;
 const volatile u32 nr_vms = 1;
-const volatile u64 timer_interval_ns = 100000;
 const volatile u64 vms[MAX_VMS];
 const volatile u32 debug = 0;
 
 /* Scheduling statistics */
 volatile u64 nr_direct_to_idle_dispatches, nr_kthread_dispatches,
     nr_vm_dispatches, nr_running;
+
+const u64 min_timer_interval_ns = 100000; // 100us
+const u64 max_timer_interval_ns = 1000000; // 1ms
+const u64 switch_time_ns = 5000000000; // 5s
+const u64 llc_miss_latency_ns = 200; // 200ns
+
+/*
+ * Data window helpers.
+ */
+static void data_window_init_idx(struct data_window* dw, u32 idx) {
+  if (idx < WINDOW_SIZE) {
+    dw->window[idx].llc_misses = 0;
+    dw->window[idx].interval_ns = switch_time_ns;
+  }
+}
+
+static void data_window_init(struct data_window* dw) {
+  memset(dw, 0, sizeof(*dw));
+  dw->current = 0;
+  data_window_init_idx(dw, 0);
+}
+
+static void data_window_advance(struct data_window* dw) {
+  u32 idx = dw->current + 1;
+  if (idx >= WINDOW_SIZE)
+    idx = 0;
+  dw->current = idx;
+  data_window_init_idx(dw, idx);
+}
+
+static struct sched_data* data_window_current(struct data_window* dw) {
+  u32 idx = dw->current;
+  return idx < WINDOW_SIZE ? &dw->window[dw->current] : NULL;
+}
+
+static void data_window_accumulate(struct data_window* dw,
+                                   struct sched_data* acc) {
+  int i;
+  memset(acc, 0, sizeof(*acc));
+  for (i = 0; i < WINDOW_SIZE; i++) {
+    acc->llc_misses += dw->window[i].llc_misses;
+    acc->interval_ns += dw->window[i].interval_ns;
+  }
+}
+
+/*
+ * Compute timer interval.
+ */
+static u64 compute_timer_interval_ns(u64 old_timer_interval_ns, struct sched_data* data) {
+  /*
+   * rho = llc_misses * llc_miss_latency / interval
+   * oversubcription_ratio = nr_vcpus / nr_cpus
+   * if rho >= 1.0:
+   *     return max_timer_interval_ns
+   * chain_latency = (oversubcription_ratio - 1) * old_timer_interval_ns * rho / (1 - rho)
+   * new_timer_interval_ns = chain_latency * 1.2
+   * if new_timer_interval_ns < min_timer_interval_ns:
+   *     new_timer_interval_ns = min_timer_interval_ns
+   * if new_timer_interval_ns > max_timer_interval_ns:
+   *     new_timer_interval_ns = max_timer_interval_ns
+   * return new_timer_interval_ns
+   */
+
+  info("compute interval: old interval=%llu, llc_misses=%llu",
+	   old_timer_interval_ns, data->llc_misses);
+
+  if (data->llc_misses == 0) {
+    // Anomalous case: no LLC misses recorded, return old interval
+    info("compute interval: llc_misses=0, returning old interval=%llu",
+     old_timer_interval_ns);
+    return old_timer_interval_ns;
+  }
+
+  // Use Q6 fixed-point (scale = 1,000,000)
+  static const u64 SCALE = 1000000;
+  static const u64 EPSILON_FP = 200000; // 0.2 in fixed-point
+  u64 llc_misses = data->llc_misses;
+  u64 interval_ns = data->interval_ns;
+  u64 rho_fp = (llc_misses * llc_miss_latency_ns * SCALE) / interval_ns;
+
+  // oversubscription_ratio = nr_vcpus / nr_cpus (fixed-point)
+  u64 oversub_fp = 0;
+  if (nr_cpus > 0)
+    oversub_fp = ((u64)nr_vcpus) * SCALE / nr_cpus;
+
+  u64 new_timer_interval_ns;
+  // If rho >= 1.0 (i.e., rho_fp >= SCALE)
+  if (rho_fp >= SCALE) {
+    new_timer_interval_ns = max_timer_interval_ns;
+    info("compute_timer_interval_ns: rho_fp >= SCALE, returning max interval=%llu",
+     max_timer_interval_ns);
+  } else {
+    // chain_latency = (oversubscription_ratio - 1) * old_timer_interval_ns * rho / (1 - rho)
+    // All in fixed-point
+    s64 oversub_minus1_fp = (s64)oversub_fp - (s64)SCALE;
+
+    // numerator: (oversub_minus1_fp * old_timer_interval_ns * rho_fp)
+    // denominator: (SCALE - rho_fp)
+    u64 denominator = SCALE - rho_fp;
+    u64 chain_latency = 0;
+    if (denominator > 0) {
+      u64 numerator = (u64)(oversub_minus1_fp) * old_timer_interval_ns * rho_fp;
+      chain_latency = numerator / denominator;
+    }
+
+    // new_timer_interval_ns = chain_latency * 1.2 (fixed-point: 1.2 = 1200000)
+    new_timer_interval_ns = (chain_latency * (SCALE + EPSILON_FP)) / SCALE / SCALE;
+
+    info("compute interval: llc_misses=%llu, sample_interval=%llu, rho_fp=%llu, "
+        "oversub_fp=%llu, chain_latency=%llu, new_timer_interval_ns=%llu",
+      llc_misses, interval_ns, rho_fp, oversub_fp, chain_latency, new_timer_interval_ns);
+  }
+
+  info("new_timer_interval_ns: %llu, old_timer_interval_ns=%llu",
+     new_timer_interval_ns, old_timer_interval_ns);
+  if (new_timer_interval_ns < min_timer_interval_ns)
+    new_timer_interval_ns = min_timer_interval_ns;
+  if (new_timer_interval_ns > max_timer_interval_ns)
+    new_timer_interval_ns = max_timer_interval_ns;
+
+  return new_timer_interval_ns;
+}
 
 /*
  * Timer for preempting CPUs.
@@ -191,7 +314,14 @@ void BPF_STRUCT_OPS(rorke_running, struct task_struct* p) {
     return;
   }
 
-  int ret = bpf_timer_start(timer, timer_interval_ns, BPF_F_TIMER_CPU_PIN);
+  struct cpu_ctx* cctx;
+  cctx = try_lookup_cpu_ctx(cpu);
+  if (!cctx) {
+    scx_bpf_error("Failed to lookup cpu_ctx for cpu - %d", cpu);
+	return;
+  }
+
+  int ret = bpf_timer_start(timer, cctx->timer_interval_ns, BPF_F_TIMER_CPU_PIN);
   if (ret == -EINVAL) {
     scx_bpf_error("Failed to pin timer for cpu - %d", cpu);
     return;
@@ -210,11 +340,43 @@ static int timer_callback(void* map, int* key, struct bpf_timer* timer) {
 
   s32 current_cpu = bpf_get_smp_processor_id();
   cctx = try_lookup_cpu_ctx(current_cpu);
-  if (cctx)
+  if (cctx) {
     cctx->preempted++;
+    cctx->preemptions_remaining--;
+    if (cctx->preemptions_remaining == 0) {
+      struct sched_data acc;
+      data_window_accumulate(&cctx->data, &acc);
+      cctx->timer_interval_ns = compute_timer_interval_ns(cctx->timer_interval_ns, &acc);
+      info("timer_callback: updated timer interval to %llu ns - pCPU %d",
+          cctx->timer_interval_ns, current_cpu);
+      cctx->preemptions_remaining = switch_time_ns / cctx->timer_interval_ns;
+      data_window_advance(&cctx->data);
+    }
+  }
 
   scx_bpf_kick_cpu(current_cpu, SCX_KICK_PREEMPT);
   trace("timer_callback: preempted CPU %d", current_cpu);
+  return 0;
+}
+
+SEC("perf_event")
+int count_llc_misses(struct bpf_perf_event_data *ctx)
+{
+  struct cpu_ctx* cctx;
+
+  u64 cnt = BPF_CORE_READ(ctx, addr);
+//   info("count_llc_misses: CPU %d, llc_misses=%llu, sample_period=%llu",
+// 	   bpf_get_smp_processor_id(), cnt, ctx->sample_period);
+
+  s32 current_cpu = bpf_get_smp_processor_id();
+  cctx = try_lookup_cpu_ctx(current_cpu);
+  if (cctx) {
+    struct sched_data* cur_data = data_window_current(&cctx->data);
+
+    if (cur_data) {
+      cur_data->llc_misses += cnt;
+    }
+  }
   return 0;
 }
 
@@ -241,6 +403,15 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(rorke_init) {
     bpf_timer_init(timer, &timers, CLOCK_MONOTONIC);
     bpf_timer_set_callback(timer, timer_callback);
     info("rorke_init: initialized timer for cpu - %d\n", i);
+    struct cpu_ctx* cctx;
+    cctx = try_lookup_cpu_ctx(i);
+    if (!cctx) {
+      scx_bpf_error("rorke_init: failed to lookup cpu_ctx for cpu - %d\n", i);
+      return -ESRCH;
+    }
+    cctx->timer_interval_ns = min_timer_interval_ns;
+    cctx->preemptions_remaining = switch_time_ns / min_timer_interval_ns;
+    data_window_init(&cctx->data);
   }
   return ret;
 }

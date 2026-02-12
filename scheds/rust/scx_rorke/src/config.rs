@@ -3,6 +3,7 @@ use serde_json::Result;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct VMConfig {
+    pub vm_name: String,
     pub vm_id: u64,
     pub vcpus: Vec<u64>,
 }
@@ -48,10 +49,12 @@ mod tests {
         let config_json = r#"
         [
             {
+				"vm_name": "vm1",
                 "vm_id": 1,
                 "vcpus": [11,12]
             },
             {
+				"vm_name": "vm2",
                 "vm_id": 2,
                 "vcpus": [21,22,23,24]
             }
@@ -78,10 +81,12 @@ mod tests {
         let config_json = r#"
         [
             {
+				"vm_name": "vm1",
                 "vm_id": 1,
                 "vcpus": [11,12,13,14]
             },
             {
+				"vm_name": "vm2",
                 "vm_id": 2,
                 "vcpus": [21,22,23,24]
             }
@@ -107,6 +112,7 @@ mod tests {
         let config_json = r#"
         [
             {
+				"vm_name": "vm1",
                 "vm_id": 1,
                 "vcpus": [11,12,13,14]
             }

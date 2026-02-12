@@ -14,7 +14,7 @@ def get_vm_pid(vm_name):
             cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True
         )
         for line in result.stdout.strip().split("\n"):
-            if vm_name in line:
+            if f"-name guest={vm_name}," in line:
                 pid = int(line.strip().split()[0])
                 return pid
     except subprocess.CalledProcessError as e:
@@ -90,10 +90,11 @@ def main():
 
         vcpu_pids = get_vcpu_pids(vm_name, vm_pid)
 
-        output.append({"vm_id": vm_pid, "vcpus": vcpu_pids})
+        output.append({"vm_name": vm_name, "vm_id": vm_pid, "vcpus": vcpu_pids})
 
     print(json.dumps(output, indent=4))
 
 
 if __name__ == "__main__":
     main()
+
